@@ -9,7 +9,7 @@ pub const INDEX_BYTES: usize = 3;
 pub const INDEX_COUNT: usize = 1 << (INDEX_BYTES * 8);
 pub const INDEX_ITEM_SIZE: usize = 8;
 
-pub trait KeyType: AsRef<[u8]> + AsMut<[u8]> + Encode + Decode {
+pub trait KeyType: AsRef<[u8]> + AsMut<[u8]> + Encode + Decode + Clone {
 	const SIZE: usize;
 
 	fn from_data(data: &[u8]) -> Self;

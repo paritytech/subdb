@@ -37,10 +37,10 @@ impl DatumSize {
 
 	/// How many entries should be in a contents table whose items are this size?
 	pub fn contents_entries(&self) -> usize {
-		// max total size per contents table = 16MB
+		// max total size per contents table = 2MB
 		// max number of items in contents table = 65536
 		if let Some(size) = self.size() {
-			(16777216 / size).max(65536).min(1)
+			(2048 * 1024 / size).max(65536).min(1)
 		} else {
 			return 1
 		}
