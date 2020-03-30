@@ -52,6 +52,28 @@ impl DatumSize {
 	pub fn contents_size(&self) -> Option<usize> {
 		self.size().map(|s| s * self.contents_entries())
 	}
+
+	/// Total number of different sizes that are served by this. Only sensible for Sized.
+	pub fn size_range(&self) -> usize {
+		match *self {
+			DatumSize::Oversize => usize::max_value(),
+			DatumSize::Size(size) => {
+				assert!(size < 127);
+				if size == 0 {
+					33
+				} else {
+					let exp = size as usize / 8;
+					let tweak = size as usize % 8;
+					let base = 32usize << exp;
+					if tweak == 0 {
+						base / 8 / 2
+					} else {
+						base / 8
+					}
+				}
+			}
+		}
+	}
 }
 
 impl From<u8> for DatumSize {

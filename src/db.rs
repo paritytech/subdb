@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::fs::{File, OpenOptions};
+use std::collections::HashMap;
 use memmap::MmapMut;
 use parity_scale_codec::{Encode, Decode};
 
@@ -9,13 +10,14 @@ use crate::types::{
 	SimpleWriter
 };
 use crate::index_item::IndexItem;
+use crate::table::{Table, TableItemIndex, RefCount};
 
 pub struct SubDb<K> {
 	#[allow(dead_code)] path: PathBuf,
 	#[allow(dead_code)] index_file: File,
 	index: MmapMut,
-	//	sized_tables: Vec<Vec<Table<K>>>,
-//	oversize_tables: Vec<Option<Table<K>>>,
+	sized_tables: Vec<Vec<Table<K>>>,
+//	oversize_tables: HashMap<usize, Table<K>>,
 	_dummy: std::marker::PhantomData<K>,
 }
 
@@ -41,10 +43,44 @@ impl<K: KeyType> SubDb<K> {
 
 	/// Finds the next place to put a piece of data of the given size. Doesn't actually write
 	/// anything yet.
-	fn find_place(&self, _datum_size: DatumSize) -> (TableIndex, EntryIndex) {
-		//TODO
+	fn find_place(&self, datum_size: DatumSize) -> (TableIndex, EntryIndex) {
+		match datum_size {
+			DatumSize::Oversize => unimplemented!(),
+			DatumSize::Size(s) => {
+				for (table_index, table) in self.sized_tables[s as usize].iter().enumerate() {
+					if let Some(entry_index) = table.next_free() {
+						return (table_index, entry_index as EntryIndex);
+					}
+				}
+				// Out of space - would create a new table
+				(self.sized_tables[s as usize].len(), 0)
+			}
+		}
+	}
 
-		(0, 0)
+	fn allocate(&mut self, datum_size: DatumSize, key: &K, actual_size: usize) -> (TableIndex, EntryIndex) {
+		match datum_size {
+			DatumSize::Oversize => unimplemented!(),
+			DatumSize::Size(s) => {
+				for (table_index, table) in self.sized_tables[s as usize].iter_mut().enumerate() {
+					if let Some(entry_index) = table.allocate(key, actual_size) {
+						return (table_index, entry_index as EntryIndex);
+					}
+				}
+				// Out of space - would create a new table
+				let (table_index, table) = self.new_table(datum_size);
+				let entry_index = table.allocate(key, actual_size).expect("Freshly created");
+				return (table_index, entry_index as EntryIndex);
+			}
+		}
+	}
+
+	fn new_table(&mut self, datum_size: DatumSize) -> (TableIndex, &mut Table<K>) {
+		let s = <u8>::from(datum_size);
+		let table_index = self.sized_tables[s as usize].len();
+		let table_path = self.table_path(s, table_index);
+		self.sized_tables[s as usize].push(Table::open(table_path, datum_size));
+		(table_index, &mut self.sized_tables[s as usize][table_index])
 	}
 
 	pub fn new(path: PathBuf) -> Self {
@@ -64,7 +100,29 @@ impl<K: KeyType> SubDb<K> {
 		let index = unsafe {
 			MmapMut::map_mut(&index_file).expect("Path must be writable.")
 		};
-		Self { path, index, index_file/*, tables: vec![]*/, _dummy: Default::default() }
+
+		let sized_tables = (0u8..127).map(|size| (0usize..)
+			.map(|table_index| {
+				let mut table_path = path.clone();
+				table_path.push(&Self::table_name(size, table_index));
+				table_path
+			})
+			.take_while(|table_path| table_path.is_file())
+			.map(|table_path| Table::open(table_path, DatumSize::from(size)))
+			.collect()
+		).collect();
+
+		Self { path, index, index_file, sized_tables, _dummy: Default::default() }
+	}
+
+	fn table_name(size: u8, table_index: TableIndex) -> String {
+		format!("{}-{}.content", size, table_index)
+	}
+
+	fn table_path(&self, size: u8, table_index: TableIndex) -> PathBuf {
+		let mut table_path = self.path.clone();
+		table_path.push(&Self::table_name(size, table_index));
+		table_path
 	}
 
 	pub fn commit(&mut self) {
@@ -79,9 +137,9 @@ impl<K: KeyType> SubDb<K> {
 
 	// NOTE: the `skipped` flag needs to stick around, even when an item is removed.
 
-	#[allow(dead_code)] pub fn get(&self, hash: &K) -> Option<Vec<u8>> {
+	fn find(&self, hash: &K) -> Option<IndexItem> {
 		let index = Self::index_of(hash);
-		let maybe_entry: Option<IndexItem> = loop {
+		loop {
 			let e: IndexItem = self.read_entry(index);
 			if !e.is_empty() && &e.key == &hash.as_ref()[0..KEY_BYTES] {
 				// Same item (almost certainly) - just need to bump the ref count on the
@@ -93,11 +151,29 @@ impl<K: KeyType> SubDb<K> {
 				// No collision - item not there.
 				return None
 			}
-		};
+		}
+	}
 
-		maybe_entry.map(|entry| {
-			// TODO: Lookup data from `entry`
-			entry.encode()
+	#[allow(dead_code)] pub fn get(&self, hash: &K) -> Option<Vec<u8>> {
+		self.find(hash).map(|entry| {
+			match entry.datum_size {
+				DatumSize::Oversize => unimplemented!(),
+				DatumSize::Size(s) =>
+					self.sized_tables[s as usize][entry.content_table]
+						.item_ref(entry.entry_index as TableItemIndex)
+						.to_vec()
+			}
+		})
+	}
+
+	#[allow(dead_code)] pub fn get_ref_count(&self, hash: &K) -> RefCount {
+		self.find(hash).map_or(0, |entry| {
+			match entry.datum_size {
+				DatumSize::Oversize => unimplemented!(),
+				DatumSize::Size(s) =>
+					self.sized_tables[s as usize][entry.content_table]
+						.item_ref_count(entry.entry_index as TableItemIndex)
+			}
 		})
 	}
 
@@ -145,10 +221,26 @@ impl<K: KeyType> SubDb<K> {
 			final_index = (final_index + 1) % INDEX_COUNT;
 		};
 
-		if !already_there {
-			// TODO: Create the new item at the place in `item` and put data.
+		if already_there {
+			match datum_size {
+				DatumSize::Oversize => unimplemented!(),
+				DatumSize::Size(s) => {
+					self.sized_tables[s as usize][item.content_table]
+						.reference(item.entry_index as TableItemIndex);
+				}
+			}
 		} else {
-			// TODO: Bump the refcount of the place in `item`.
+			let (content_table, entry_index) = self.allocate(datum_size, hash, data.len());
+			assert_eq!(item.content_table, content_table);
+			assert_eq!(item.entry_index, entry_index);
+			match datum_size {
+				DatumSize::Oversize => unimplemented!(),
+				DatumSize::Size(s) => {
+					self.sized_tables[s as usize][content_table]
+						.item_mut(entry_index as TableItemIndex)
+						.copy_from_slice(data);
+				}
+			}
 		}
 	}
 }

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::fs::{File, OpenOptions};
 use std::mem::size_of;
 use memmap::{MmapMut, MmapOptions};
-use parity_scale_codec::{self as codec, Encode, Decode};
+use parity_scale_codec::{self as codec, Encode, Decode, Compact};
 use crate::types::{KeyType, SimpleWriter};
 use crate::datum_size::DatumSize;
 
@@ -56,12 +56,13 @@ impl TableHeader {
 	}
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum ItemHeader<K: Encode + Decode> {
 	Allocated {
 		/// Number of times this item has been inserted, without a corresponding remove, into the
 		/// database.
 		ref_count: RefCount,
+		size_correction: u32,
 		key: K,
 	},
 	Free(
@@ -78,13 +79,24 @@ impl<K: Encode + Decode> ItemHeader<K> {
 			ItemHeader::Allocated {..} => panic!("Free expected. Database corruption?"),
 		}
 	}
+
+	fn as_size_correction(&self) -> usize {
+		match self {
+			ItemHeader::Allocated { size_correction, .. } => *size_correction as usize,
+			ItemHeader::Free(_) => panic!("Allocated expected. Database corruption?"),
+		}
+	}
 }
 
+// TODO: Two smaller ItemHeader Encode/Decode shim impls to be used depending on size range of this
+//       table's entries.
+//       Smaller ranges need only u8 or u16 size_corrections.
 impl<K: Encode + Decode> Decode for ItemHeader<K> {
 	fn decode<I: codec::Input>(input: &mut I) -> Result<Self, codec::Error> {
 		let ref_count = RefCount::decode(input)?;
+		let size_correction = u32::decode(input)?.into();
 		Ok(if ref_count > 0 {
-			Self::Allocated { ref_count, key: K::decode(input)? }
+			Self::Allocated { ref_count, size_correction, key: K::decode(input)? }
 		} else {
 			Self::Free(TableItemIndex::decode(input)?)
 		})
@@ -94,9 +106,9 @@ impl<K: Encode + Decode> Decode for ItemHeader<K> {
 impl<K: Encode + Decode> Encode for ItemHeader<K> {
 	fn encode_to<O: codec::Output>(&self, output: &mut O) {
 		match self {
-			ItemHeader::Allocated { ref_count, key} => {
+			ItemHeader::Allocated { ref_count, size_correction, key} => {
 				assert!(*ref_count > 0);
-				(ref_count, key).encode_to(output);
+				(ref_count, size_correction, key).encode_to(output);
 			}
 			ItemHeader::Free(index) => {
 				(RefCount::default(), index).encode_to(output);
@@ -106,7 +118,7 @@ impl<K: Encode + Decode> Encode for ItemHeader<K> {
 }
 
 impl<K: KeyType> Table<K> {
-	fn open(path: PathBuf, datum_size: DatumSize) -> Self {
+	pub fn open(path: PathBuf, datum_size: DatumSize) -> Self {
 		assert!(!path.exists() || path.is_file(), "Path must either not exist or be a file.");
 
 		let file = OpenOptions::new()
@@ -118,7 +130,7 @@ impl<K: KeyType> Table<K> {
 		let len = file.metadata().expect("File must be readable").len();
 		let value_size = datum_size.size().expect("Data must be sized");
 		let item_count = datum_size.contents_entries() as TableItemCount;
-		let item_header_size = size_of::<RefCount>() + K::SIZE.max(size_of::<TableItemIndex>());
+		let item_header_size = size_of::<RefCount>() + size_of::<u32>() + K::SIZE.max(size_of::<TableItemIndex>());
 		let item_size = value_size + item_header_size;
 		let table_header_size = size_of::<TableHeader>();
 		let total_size = table_header_size + item_size * item_count as usize;
@@ -164,11 +176,6 @@ impl<K: KeyType> Table<K> {
 		*self.header_mut() = h;
 	}
 
-	/// Attempt to find a free slot (but do not allocate).
-	fn next_free(&self) -> Option<TableItemIndex> {
-		self.header().next_free(self.item_count)
-	}
-
 	fn mutate_item_header<R>(&mut self, i: TableItemIndex, f: impl FnOnce(&mut ItemHeader<K>) -> R) -> R {
 		let data = &mut self.data[
 			self.item_size * i as usize..self.item_size * i as usize + self.item_header_size
@@ -179,16 +186,38 @@ impl<K: KeyType> Table<K> {
 		r
 	}
 
+	fn item_header(&self, i: TableItemIndex) -> ItemHeader<K> {
+		let data = &self.data[
+			self.item_size * i as usize..self.item_size * i as usize + self.item_header_size
+		];
+		ItemHeader::decode(&mut &data[..]).expect("Database corrupt?")
+	}
+
+	/// Attempt to find a free slot (but do not allocate).
+	pub fn next_free(&self) -> Option<TableItemIndex> {
+		self.header().next_free(self.item_count)
+	}
+
+	/// Retrieve a table item's data as an immutable pointer.
+	pub fn item_ref_count(&self, i: TableItemIndex) -> RefCount {
+		match self.item_header(i) {
+			ItemHeader::Free(_) => 0,
+			ItemHeader::Allocated { ref_count, .. } => ref_count,
+		}
+	}
+
 	/// Retrieve a table item's data as an immutable pointer.
 	pub fn item_ref(&self, i: TableItemIndex) -> &[u8] {
+		let size = self.value_size - self.item_header(i).as_size_correction();
 		let p = self.item_size * i as usize + self.item_header_size;
-		&self.data[p..p + self.value_size]
+		&self.data[p..p + size]
 	}
 
 	/// Retrieve a table item's data as a mutable pointer.
 	pub fn item_mut(&mut self, i: TableItemIndex) -> &mut [u8] {
+		let size = self.value_size - self.item_header(i).as_size_correction();
 		let p = self.item_size * i as usize + self.item_header_size;
-		&mut self.data[p..p + self.value_size]
+		&mut self.data[p..p + size]
 	}
 
 	/// Add another reference to a slot that is already allocated and return the resulting number of
@@ -206,14 +235,16 @@ impl<K: KeyType> Table<K> {
 	}
 
 	/// Attempt to allocate a slot.
-	pub fn allocate(&mut self, key: &K) -> Option<TableItemIndex> {
+	pub fn allocate(&mut self, key: &K, size: usize) -> Option<TableItemIndex> {
 		let mut h = self.header().clone();
+		let size_correction = (self.value_size - size) as u32;
+		// OPTIMISE: Avoid extra copy of `key` by writing directly to map.
+		let new_item = ItemHeader::Allocated { ref_count: 1, size_correction, key: key.clone() };
 		let result = if h.used < h.touched_count {
 			let result = h.next_free;
 			let new_next_free = self.mutate_item_header(result, |item| {
 				let new_next_free = item.as_next_free();
-				// OPTIMISE: Avoid extra copy of `key` by writing directly to map.
-				*item = ItemHeader::Allocated { ref_count: 1, key: key.clone() };
+				*item = new_item;
 				new_next_free
 			});
 			h.next_free = new_next_free;
@@ -227,8 +258,8 @@ impl<K: KeyType> Table<K> {
 				h.used += 1;
 				self.mutate_item_header(result, |item| {
 					assert!(matches!(item, ItemHeader::Free(_)), "Free slot expected. Database corrupt?");
-					// OPTIMISE: Avoid extra copy of `key` by writing directly to map.
-					*item = ItemHeader::Allocated { ref_count: 1, key: key.clone() };
+					dbg!(&new_item);
+					*item = new_item;
 				});
 				result
 			} else {
@@ -268,7 +299,7 @@ impl<K: KeyType> Table<K> {
 	}
 
 	/// The amount of slots left in this table.
-	fn available(&self) -> TableItemCount {
+	pub fn available(&self) -> TableItemCount {
 		self.item_count - self.header().used
 	}
 }
