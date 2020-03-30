@@ -8,6 +8,7 @@ use crate::datum_size::DatumSize;
 pub struct IndexItem {
 	/// The first four bytes of the key (which should itself just be the result of a cryptographic
 	/// hash).
+	// TODO: Switch to SmallVec so we can reuse this struct with different tables.
 	pub key: [u8; KEY_BYTES],
 	/// The instance of the content table that the data is stored in.
 	pub content_table: TableIndex,

@@ -1,5 +1,7 @@
 use std::mem::size_of;
 
+const MAX_SIZE: u8 = 63;
+
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum DatumSize {
 	Oversize,
@@ -10,12 +12,19 @@ impl DatumSize {
 	pub fn size(&self) -> Option<usize> {
 		match *self {
 			DatumSize::Oversize => None,
-			DatumSize::Size(size) => {
-				assert!(size < 127);
-				let exp = size as usize / 8;
-				let tweak = size as usize % 8;
-				let base = 32usize << exp;
-				Some(base + base / 8 * tweak)
+			DatumSize::Size(size_class) => {
+				assert!(size_class < MAX_SIZE);
+				if size_class < 32 {
+					let exp = size_class as usize / 8;
+					let tweak = size_class as usize % 8;
+					let base = 32usize << exp;
+					Some(base + base / 8 * tweak)
+				} else {
+					let exp = size_class as usize / 4 - 4;
+					let tweak = size_class as usize % 4;
+					let base = 32usize << exp;
+					Some(base + base / 4 * tweak)
+				}
 			}
 		}
 	}
@@ -25,14 +34,27 @@ impl DatumSize {
 		if s <= 32 {
 			return DatumSize::Size(0)
 		}
-		if s > 1835008 {
-			return DatumSize::Oversize
-		}
 		let exp = size_of::<usize>() as usize * 8 - s.leading_zeros() as usize - 6;
 		let base = 32usize << exp;
-		let incr = base / 8;
-		let incrs = (s - base + incr - 1) / incr;
-		DatumSize::Size((exp * 8 + incrs) as u8)
+		let rem = s - base;
+
+		let result = if exp < 4 {
+			// incr of 1/8
+			let incr = base / 8;
+			let incrs = (rem + incr - 1) / incr;
+			exp * 8 + incrs
+		} else {
+			// incr of 1/4
+			let incr = base / 4;
+			let incrs = (rem + incr - 1) / incr;
+			32 + ((exp - 4) * 4) + incrs
+		};
+
+		if result < MAX_SIZE as usize {
+			DatumSize::Size(result as u8)
+		} else {
+			DatumSize::Oversize
+		}
 	}
 
 	/// How many entries should be in a contents table whose items are this size?
@@ -57,18 +79,29 @@ impl DatumSize {
 	pub fn size_range(&self) -> usize {
 		match *self {
 			DatumSize::Oversize => usize::max_value(),
-			DatumSize::Size(size) => {
-				assert!(size < 127);
-				if size == 0 {
+			DatumSize::Size(size_class) => {
+				assert!(size_class < MAX_SIZE);
+				if size_class == 0 {
 					33
 				} else {
-					let exp = size as usize / 8;
-					let tweak = size as usize % 8;
-					let base = 32usize << exp;
-					if tweak == 0 {
-						base / 8 / 2
+					if size_class <= 32 {
+						let exp = size_class as usize / 8;
+						let tweak = size_class as usize % 8;
+						let base = 32usize << exp;
+						if tweak == 0 {
+							base / 8 / 2
+						} else {
+							base / 8
+						}
 					} else {
-						base / 8
+						let exp = size_class as usize / 4 - 4;
+						let tweak = size_class as usize % 4;
+						let base = 32usize << exp;
+						if tweak == 0 {
+							base / 4 / 2
+						} else {
+							base / 4
+						}
 					}
 				}
 			}
@@ -78,7 +111,7 @@ impl DatumSize {
 
 impl From<u8> for DatumSize {
 	fn from(x: u8) -> Self {
-		if x < 127 {
+		if x < MAX_SIZE {
 			DatumSize::Size(x)
 		} else {
 			DatumSize::Oversize
@@ -89,7 +122,7 @@ impl From<u8> for DatumSize {
 impl From<DatumSize> for u8 {
 	fn from(x: DatumSize) -> u8 {
 		match x {
-			DatumSize::Oversize => 127,
+			DatumSize::Oversize => MAX_SIZE,
 			DatumSize::Size(x) => x,
 		}
 	}
@@ -107,18 +140,23 @@ fn datum_size_works() {
 	assert_eq!(DatumSize::from(16).size().unwrap(), 128);
 	assert_eq!(DatumSize::from(17).size().unwrap(), 144);
 	assert_eq!(DatumSize::from(24).size().unwrap(), 256);
+	assert_eq!(DatumSize::from(31).size().unwrap(), 480);
 	assert_eq!(DatumSize::from(32).size().unwrap(), 512);
-	assert_eq!(DatumSize::from(40).size().unwrap(), 1_024);
-	assert_eq!(DatumSize::from(48).size().unwrap(), 2_048);
-	assert_eq!(DatumSize::from(56).size().unwrap(), 4_096);
-	assert_eq!(DatumSize::from(64).size().unwrap(), 8_192);
-	assert_eq!(DatumSize::from(72).size().unwrap(), 16_384);
-	assert_eq!(DatumSize::from(80).size().unwrap(), 32_768);
-	assert_eq!(DatumSize::from(88).size().unwrap(), 65_536);
-	assert_eq!(DatumSize::from(96).size().unwrap(), 131_072);
-	assert_eq!(DatumSize::from(104).size().unwrap(), 262_144);
-	assert_eq!(DatumSize::from(126).size().unwrap(), 1_835_008);
-	assert_eq!(DatumSize::from(127).size(), None);
+	assert_eq!(DatumSize::from(33).size().unwrap(), 640);
+	assert_eq!(DatumSize::from(34).size().unwrap(), 768);
+	assert_eq!(DatumSize::from(35).size().unwrap(), 896);
+	assert_eq!(DatumSize::from(36).size().unwrap(), 1_024);
+	assert_eq!(DatumSize::from(37).size().unwrap(), 1_280);
+	assert_eq!(DatumSize::from(38).size().unwrap(), 1_536);
+	assert_eq!(DatumSize::from(39).size().unwrap(), 1_792);
+	assert_eq!(DatumSize::from(40).size().unwrap(), 2_048);
+	assert_eq!(DatumSize::from(44).size().unwrap(), 4_096);
+	assert_eq!(DatumSize::from(48).size().unwrap(), 8_192);
+	assert_eq!(DatumSize::from(52).size().unwrap(), 16_384);
+	assert_eq!(DatumSize::from(56).size().unwrap(), 32_768);
+	assert_eq!(DatumSize::from(60).size().unwrap(), 65_536);
+	assert_eq!(DatumSize::from(62).size().unwrap(), 98_304);
+	assert_eq!(DatumSize::from(63).size(), None);
 
 	assert_eq!(DatumSize::nearest(0).size().unwrap(), 32);
 	assert_eq!(DatumSize::nearest(29).size().unwrap(), 32);
@@ -145,7 +183,15 @@ fn datum_size_works() {
 	assert_eq!(DatumSize::nearest(71).size().unwrap(), 72);
 	assert_eq!(DatumSize::nearest(72).size().unwrap(), 72);
 	assert_eq!(DatumSize::nearest(73).size().unwrap(), 80);
-	assert_eq!(DatumSize::nearest(1_835_007).size().unwrap(), 1_835_008);
-	assert_eq!(DatumSize::nearest(1_835_008).size().unwrap(), 1_835_008);
-	assert_eq!(DatumSize::nearest(1_835_009).size(), None);
+
+	assert_eq!(DatumSize::nearest(480).size().unwrap(), 480);
+	assert_eq!(DatumSize::nearest(481).size().unwrap(), 512);
+	assert_eq!(DatumSize::nearest(512).size().unwrap(), 512);
+	assert_eq!(DatumSize::nearest(513).size().unwrap(), 640);
+	assert_eq!(DatumSize::nearest(640).size().unwrap(), 640);
+	assert_eq!(DatumSize::nearest(641).size().unwrap(), 768);
+
+	assert_eq!(DatumSize::nearest(98_303).size().unwrap(), 98_304);
+	assert_eq!(DatumSize::nearest(98_304).size().unwrap(), 98_304);
+	assert_eq!(DatumSize::nearest(98_305).size(), None);
 }
