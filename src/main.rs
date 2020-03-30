@@ -1,13 +1,13 @@
 use std::path::PathBuf;
+use log::info;
 
 mod datum_size;
-mod db;
+mod database;
 mod index_item;
 mod table;
 mod types;
 
-use db::SubDb;
-use types::KeyType;
+pub use database::{Database, Options};
 
 // TODO: Adaptive index size (bitwise increase).
 // DONE: Better format for index n-bytes up to 4 bytes rest-of-key, 16-bit location-correction, 8-
@@ -24,42 +24,51 @@ use types::KeyType;
 // TODO: Oversize content tables.
 // TODO: Content tables should be able to grow.
 // TODO: Versioning.
+// DONE: Remove items.
 
 fn main() {
-	let path = PathBuf::from("/tmp/test");
-	std::fs::remove_dir_all(&path);
+	simplelog::CombinedLogger::init(
+		vec![
+			simplelog::TermLogger::new(simplelog::LevelFilter::Info, simplelog::Config::default(), simplelog::TerminalMode::Mixed).unwrap(),
+		]
+	).unwrap();
 
+	let path = PathBuf::from("/tmp/test");
+	std::fs::remove_dir_all(&path).unwrap();
+
+	type Key = [u8; 8];
 	let key = {
-		let mut db = SubDb::<[u8; 32]>::open(path.clone(), 4, 24);
-		let key = db.put(b"Hello world!");
-		let value = db.get(&key);
-		dbg!(value.and_then(|b| String::from_utf8(b).ok()));
-		key
+		let mut db = Options::new()
+			.key_bytes(1)
+			.index_bits(4)
+			.path(path.clone())
+			.open::<Key>()
+			.unwrap();
+		db.put(b"Hello world!")
 	};
 
 	{
-		let mut db = SubDb::<[u8; 32]>::open(path.clone(), 4, 24);
+		let mut db = Options::from_path(path.clone()).open::<Key>().unwrap();
 
 		let value = db.get(&key);
-		dbg!(value.and_then(|b| String::from_utf8(b).ok()));
-		dbg!(db.get_ref_count(&key));
+		println!("Value: {:?}", value.and_then(|b| String::from_utf8(b).ok()));
+		println!("Refs: {}", db.get_ref_count(&key));
 
 		let value = db.get(&Default::default());
-		dbg!(&value);
+		println!("Empty value: {:?}", value);
 
-		println!("Info: {:?}", db.info());
+		info!("Info: {:?}", db.info());
 
-		let value = db.get(&key);
-		db.remove(&key);
+		let _value = db.get(&key);
+		db.remove(&key).unwrap();
 	}
 
 	{
-		let mut db = SubDb::<[u8; 32]>::open(path, 4, 24);
+		let db = Options::from_path(path.clone()).open::<Key>().unwrap();
 
-		println!("Info: {:?}", db.info());
+		info!("Info: {:?}", db.info());
 
 		let value = db.get(&key);
-		dbg!(value.and_then(|b| String::from_utf8(b).ok()));
-		dbg!(db.get_ref_count(&key));
+		println!("Value: {:?}", value.and_then(|b| String::from_utf8(b).ok()));
 	}
 }

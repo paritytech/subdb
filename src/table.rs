@@ -1,8 +1,8 @@
 use std::path::PathBuf;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::mem::size_of;
 use memmap::{MmapMut, MmapOptions};
-use parity_scale_codec::{self as codec, Encode, Decode, Compact};
+use parity_scale_codec::{self as codec, Encode, Decode};
 use crate::types::{KeyType, SimpleWriter};
 use crate::datum_size::DatumSize;
 
@@ -17,6 +17,7 @@ pub type TableItemIndex = u16;
 pub type TableItemCount = u32;
 
 pub struct Table<K> {
+	#[allow(dead_code)]
 	file: std::fs::File,
 	data: MmapMut,
 	header_data: MmapMut,
@@ -42,20 +43,6 @@ struct TableHeader {
 	touched_count: TableItemCount,
 }
 
-impl TableHeader {
-	fn next_free(&self, item_count: TableItemCount) -> Option<TableItemIndex> {
-		if self.used < self.touched_count {
-			Some(self.next_free as TableItemIndex)
-		} else {
-			if self.touched_count < item_count {
-				Some(self.touched_count as u16)
-			} else {
-				None
-			}
-		}
-	}
-}
-
 #[derive(Clone, Debug)]
 enum ItemHeader<K: Encode + Decode> {
 	Allocated {
@@ -72,7 +59,7 @@ enum ItemHeader<K: Encode + Decode> {
 	),
 }
 
-impl<K: Encode + Decode> ItemHeader<K> {
+impl<K: Encode + Decode + Eq> ItemHeader<K> {
 	fn as_next_free(&self) -> TableItemIndex {
 		match self {
 			ItemHeader::Free(next_free) => *next_free,
@@ -80,9 +67,15 @@ impl<K: Encode + Decode> ItemHeader<K> {
 		}
 	}
 
-	fn as_size_correction(&self) -> usize {
+	fn as_allocation(&self, check_hash: Option<&K>) -> Result<(RefCount, usize), ()> {
 		match self {
-			ItemHeader::Allocated { size_correction, .. } => *size_correction as usize,
+			ItemHeader::Allocated { ref_count, size_correction, key} => {
+				if check_hash.map_or(true, |hash| hash == key) {
+					Ok((*ref_count, *size_correction as usize))
+				} else {
+					Err(())
+				}
+			},
 			ItemHeader::Free(_) => panic!("Allocated expected. Database corruption?"),
 		}
 	}
@@ -201,6 +194,7 @@ impl<K: KeyType> Table<K> {
 		ItemHeader::decode(&mut &data[..]).expect("Database corrupt?")
 	}
 
+	#[allow(dead_code)]
 	fn set_item_header<R>(&mut self, i: TableItemIndex, h: ItemHeader<K>) {
 		let data = &mut self.data[
 			self.item_size * i as usize..self.item_size * i as usize + self.item_header_size
@@ -208,60 +202,44 @@ impl<K: KeyType> Table<K> {
 		h.encode_to(&mut SimpleWriter(data, 0));
 	}
 
-	/// Attempt to find a free slot (but do not allocate).
-	pub fn next_free(&self) -> Option<TableItemIndex> {
-		self.header().next_free(self.item_count)
+	/// Retrieve a table item's data as an immutable pointer.
+	pub fn item_ref_count(&self, i: TableItemIndex, check_hash: Option<&K>) -> Result<RefCount, ()> {
+		Ok(self.item_header(i).as_allocation(check_hash)?.0)
 	}
 
 	/// Retrieve a table item's data as an immutable pointer.
-	pub fn item_ref_count(&self, i: TableItemIndex) -> RefCount {
-		match self.item_header(i) {
-			ItemHeader::Free(_) => 0,
-			ItemHeader::Allocated { ref_count, .. } => ref_count,
-		}
-	}
-
-	/// Retrieve a table item's data as an immutable pointer.
-	pub fn item_ref(&self, i: TableItemIndex) -> &[u8] {
-		let size = self.value_size - self.item_header(i).as_size_correction();
+	pub fn item_ref(&self, i: TableItemIndex, check_hash: Option<&K>) -> Result<&[u8], ()> {
+		let size = self.value_size - self.item_header(i).as_allocation(check_hash)?.1;
 		let p = self.item_size * i as usize + self.item_header_size;
-		&self.data[p..p + size]
+		Ok(&self.data[p..p + size])
 	}
 
 	/// Retrieve a table item's data as a mutable pointer.
 	pub fn item_mut(&mut self, i: TableItemIndex) -> &mut [u8] {
-		let size = self.value_size - self.item_header(i).as_size_correction();
+		let size = self.value_size - self.item_header(i).as_allocation(None)
+			.expect("Unreachable with no check.").1;
 		let p = self.item_size * i as usize + self.item_header_size;
 		&mut self.data[p..p + size]
 	}
 
-	/// Add another reference to a slot that is already allocated and return the resulting number of
-	/// references. Err if the slot is not allocated.
-	pub fn bump(&mut self, i: TableItemIndex) -> Result<RefCount, ()> {
-		self.mutate_item_header(i, |item| {
-			match item {
-				ItemHeader::Allocated { ref mut ref_count, .. } => {
-					*ref_count += 1;
-					Ok(*ref_count)
-				}
-				ItemHeader::Free(..) => Err(()),
-			}
-		})
+	fn check_key(hash: Option<&K>, key: &K) -> Result<(), ()> {
+		if hash.map_or(true, |k| k == key) {
+			Ok(())
+		} else {
+			Err(())
+		}
 	}
 
 	/// Add another reference to a slot that is already allocated and return the resulting number of
 	/// references. Err if the slot is not allocated or if the given `hash` if different to the
 	/// hash of the entry.
-	pub fn checked_bump(&mut self, i: TableItemIndex, hash: &K) -> Result<RefCount, ()> {
+	pub fn bump(&mut self, i: TableItemIndex, hash: Option<&K>) -> Result<RefCount, ()> {
 		self.mutate_item_header(i, |item| {
 			match item {
 				ItemHeader::Allocated { ref mut ref_count, ref key, .. } => {
-					if hash == key {
-						*ref_count += 1;
-						Ok(*ref_count)
-					} else {
-						Err(())
-					}
+					Self::check_key(hash, key)?;
+					*ref_count += 1;
+					Ok(*ref_count)
 				}
 				ItemHeader::Free(..) => Err(()),
 			}
@@ -290,7 +268,6 @@ impl<K: KeyType> Table<K> {
 				let result = h.touched_count as TableItemIndex;
 				self.mutate_item_header(result, |item| {
 					assert!(matches!(item, ItemHeader::Free(_)), "Free slot expected. Database corrupt?");
-					dbg!(&new_item);
 					*item = new_item;
 				});
 				h.touched_count += 1;
@@ -311,14 +288,11 @@ impl<K: KeyType> Table<K> {
 		let result = self.mutate_item_header(i, |item| {
 			match item {
 				ItemHeader::Allocated { ref mut ref_count, ref key, .. } => {
-					if check_hash.map_or(true, |hash| key == hash) {
-						assert!(*ref_count > 0, "Database corrupt? Zero refs.");
-						if *ref_count > 1 {
-							*ref_count -= 1;
-							return Ok(*ref_count)
-						}
-					} else {
-						return Err(())
+					Self::check_key(check_hash, key)?;
+					assert!(*ref_count > 0, "Database corrupt? Zero refs.");
+					if *ref_count > 1 {
+						*ref_count -= 1;
+						return Ok(*ref_count)
 					}
 				}
 				ItemHeader::Free(..) => return Err(()),
@@ -338,16 +312,19 @@ impl<K: KeyType> Table<K> {
 	}
 
 	/// The amount of slots left in this table.
+	#[allow(dead_code)]
 	pub fn used(&self) -> TableItemCount {
 		self.header().used
 	}
 
 	/// The amount of slots left in this table.
+	#[allow(dead_code)]
 	pub fn total(&self) -> TableItemCount {
 		self.item_count
 	}
 
 	/// The amount of slots left in this table.
+	#[allow(dead_code)]
 	pub fn available(&self) -> TableItemCount {
 		self.item_count - self.header().used
 	}
