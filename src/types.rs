@@ -4,24 +4,24 @@ use parity_scale_codec::{self as codec, Encode, Decode};
 pub type TableIndex = usize;
 pub type EntryIndex = usize;
 
-pub const KEY_BYTES: usize = 4;
-pub const INDEX_BYTES: usize = 3;
-pub const INDEX_COUNT: usize = 1 << (INDEX_BYTES * 8);
-pub const INDEX_ITEM_SIZE: usize = 8;
-
-pub trait KeyType: AsRef<[u8]> + AsMut<[u8]> + Encode + Decode + Clone + std::fmt::Debug {
+pub trait KeyType: AsRef<[u8]> + AsMut<[u8]> + Encode + Decode + Eq + Clone + std::fmt::Debug {
 	const SIZE: usize;
-
 	fn from_data(data: &[u8]) -> Self;
 }
 
 impl KeyType for [u8; 32] {
 	const SIZE: usize = 32;
-
 	fn from_data(data: &[u8]) -> Self {
 		let mut r = Self::default();
 		r.copy_from_slice(&blake2b(32, &[], data).as_bytes()[..]);
 		r
+	}
+}
+
+impl KeyType for [u8; 1] {
+	const SIZE: usize = 1;
+	fn from_data(data: &[u8]) -> Self {
+		[data.first().cloned().unwrap_or(0)]
 	}
 }
 

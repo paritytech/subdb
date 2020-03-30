@@ -10,7 +10,7 @@ use db::SubDb;
 use types::KeyType;
 
 // TODO: Adaptive index size (bitwise increase).
-// TODO: Better format for index n-bytes up to 4 bytes rest-of-key, 16-bit location-correction, 8-
+// DONE: Better format for index n-bytes up to 4 bytes rest-of-key, 16-bit location-correction, 8-
 //       bit skipped counter.
 //       - for 0-7 bit table (1 - 128 entries), then 4 bytes rest-of-key.
 //       - for 8-15 bit table (256 - 32768 entries), then 3 bytes rest-of-key.
@@ -23,18 +23,43 @@ use types::KeyType;
 //       it was already taken.
 // TODO: Oversize content tables.
 // TODO: Content tables should be able to grow.
-// TODO: Remove items.
 // TODO: Versioning.
 
 fn main() {
-	let mut db = SubDb::<[u8; 32]>::new(PathBuf::from("/tmp/test"));
-//	let key = db.put(b"Hello world!");
-	let key = <[u8; 32]>::from_data(b"Hello world!");
-	dbg!(&key);
-	let value = db.get(&key);
-	dbg!(value.and_then(|b| String::from_utf8(b).ok()));
-	dbg!(db.get_ref_count(&key));
-	let value = db.get(&Default::default());
-	dbg!(&value);
-	db.commit();
+	let path = PathBuf::from("/tmp/test");
+	std::fs::remove_dir_all(&path);
+
+	let key = {
+		let mut db = SubDb::<[u8; 32]>::open(path.clone(), 4, 24);
+		let key = db.put(b"Hello world!");
+		let value = db.get(&key);
+		dbg!(value.and_then(|b| String::from_utf8(b).ok()));
+		key
+	};
+
+	{
+		let mut db = SubDb::<[u8; 32]>::open(path.clone(), 4, 24);
+
+		let value = db.get(&key);
+		dbg!(value.and_then(|b| String::from_utf8(b).ok()));
+		dbg!(db.get_ref_count(&key));
+
+		let value = db.get(&Default::default());
+		dbg!(&value);
+
+		println!("Info: {:?}", db.info());
+
+		let value = db.get(&key);
+		db.remove(&key);
+	}
+
+	{
+		let mut db = SubDb::<[u8; 32]>::open(path, 4, 24);
+
+		println!("Info: {:?}", db.info());
+
+		let value = db.get(&key);
+		dbg!(value.and_then(|b| String::from_utf8(b).ok()));
+		dbg!(db.get_ref_count(&key));
+	}
 }

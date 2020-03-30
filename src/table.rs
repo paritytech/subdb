@@ -118,6 +118,10 @@ impl<K: Encode + Decode> Encode for ItemHeader<K> {
 }
 
 impl<K: KeyType> Table<K> {
+	pub fn commit(&mut self) {
+		self.data.flush().expect("I/O Error");
+	}
+
 	pub fn open(path: PathBuf, datum_size: DatumSize) -> Self {
 		assert!(!path.exists() || path.is_file(), "Path must either not exist or be a file.");
 
@@ -176,6 +180,10 @@ impl<K: KeyType> Table<K> {
 		*self.header_mut() = h;
 	}
 
+	pub fn bytes_used(&self) -> usize {
+		self.data.len()
+	}
+
 	fn mutate_item_header<R>(&mut self, i: TableItemIndex, f: impl FnOnce(&mut ItemHeader<K>) -> R) -> R {
 		let data = &mut self.data[
 			self.item_size * i as usize..self.item_size * i as usize + self.item_header_size
@@ -191,6 +199,13 @@ impl<K: KeyType> Table<K> {
 			self.item_size * i as usize..self.item_size * i as usize + self.item_header_size
 		];
 		ItemHeader::decode(&mut &data[..]).expect("Database corrupt?")
+	}
+
+	fn set_item_header<R>(&mut self, i: TableItemIndex, h: ItemHeader<K>) {
+		let data = &mut self.data[
+			self.item_size * i as usize..self.item_size * i as usize + self.item_header_size
+		];
+		h.encode_to(&mut SimpleWriter(data, 0));
 	}
 
 	/// Attempt to find a free slot (but do not allocate).
@@ -222,12 +237,31 @@ impl<K: KeyType> Table<K> {
 
 	/// Add another reference to a slot that is already allocated and return the resulting number of
 	/// references. Err if the slot is not allocated.
-	pub fn reference(&mut self, i: TableItemIndex) -> Result<RefCount, ()> {
+	pub fn bump(&mut self, i: TableItemIndex) -> Result<RefCount, ()> {
 		self.mutate_item_header(i, |item| {
 			match item {
 				ItemHeader::Allocated { ref mut ref_count, .. } => {
 					*ref_count += 1;
 					Ok(*ref_count)
+				}
+				ItemHeader::Free(..) => Err(()),
+			}
+		})
+	}
+
+	/// Add another reference to a slot that is already allocated and return the resulting number of
+	/// references. Err if the slot is not allocated or if the given `hash` if different to the
+	/// hash of the entry.
+	pub fn checked_bump(&mut self, i: TableItemIndex, hash: &K) -> Result<RefCount, ()> {
+		self.mutate_item_header(i, |item| {
+			match item {
+				ItemHeader::Allocated { ref mut ref_count, ref key, .. } => {
+					if hash == key {
+						*ref_count += 1;
+						Ok(*ref_count)
+					} else {
+						Err(())
+					}
 				}
 				ItemHeader::Free(..) => Err(()),
 			}
@@ -254,13 +288,14 @@ impl<K: KeyType> Table<K> {
 		} else {
 			if h.touched_count < self.item_count {
 				let result = h.touched_count as TableItemIndex;
-				h.touched_count += 1;
-				h.used += 1;
 				self.mutate_item_header(result, |item| {
 					assert!(matches!(item, ItemHeader::Free(_)), "Free slot expected. Database corrupt?");
 					dbg!(&new_item);
 					*item = new_item;
 				});
+				h.touched_count += 1;
+				h.used += 1;
+				self.set_header(h);
 				result
 			} else {
 				return None
@@ -271,15 +306,19 @@ impl<K: KeyType> Table<K> {
 
 	/// Free up a slot or decrease the reference count if it's greater than 1. Returns Ok along with
 	/// the number of refs remaining, or Err if the slot was already free.
-	pub fn free(&mut self, i: TableItemIndex) -> Result<RefCount, ()> {
+	pub fn free(&mut self, i: TableItemIndex, check_hash: Option<&K>) -> Result<RefCount, ()> {
 		let mut h = *self.header();
 		let result = self.mutate_item_header(i, |item| {
 			match item {
-				ItemHeader::Allocated { ref mut ref_count, .. } => {
-					assert!(*ref_count > 0, "Database corrupt? Zero refs.");
-					if *ref_count > 1 {
-						*ref_count -= 1;
-						return Ok(*ref_count)
+				ItemHeader::Allocated { ref mut ref_count, ref key, .. } => {
+					if check_hash.map_or(true, |hash| key == hash) {
+						assert!(*ref_count > 0, "Database corrupt? Zero refs.");
+						if *ref_count > 1 {
+							*ref_count -= 1;
+							return Ok(*ref_count)
+						}
+					} else {
+						return Err(())
 					}
 				}
 				ItemHeader::Free(..) => return Err(()),
@@ -299,7 +338,39 @@ impl<K: KeyType> Table<K> {
 	}
 
 	/// The amount of slots left in this table.
+	pub fn used(&self) -> TableItemCount {
+		self.header().used
+	}
+
+	/// The amount of slots left in this table.
+	pub fn total(&self) -> TableItemCount {
+		self.item_count
+	}
+
+	/// The amount of slots left in this table.
 	pub fn available(&self) -> TableItemCount {
 		self.item_count - self.header().used
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::*;
+	use std::path::PathBuf;
+
+	#[test]
+	fn database_should_work() {
+		std::fs::remove_file("/tmp/test-table");
+		let x = {
+			let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into());
+			let x = t.allocate(&[42u8], 12).unwrap();
+			t.item_mut(x).copy_from_slice(b"Hello world!");
+			assert_eq!(t.item_ref(x), b"Hello world!");
+			t.commit();
+			x
+		};
+		let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into());
+		assert_eq!(t.item_ref(x), b"Hello world!");
 	}
 }

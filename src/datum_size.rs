@@ -1,12 +1,23 @@
 use std::mem::size_of;
+use std::fmt;
 
 const MAX_SIZE: u8 = 63;
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DatumSize {
 	Oversize,
 	Size(u8),
 }
+
+impl fmt::Debug for DatumSize {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			DatumSize::Oversize => write!(f, "Oversize"),
+			DatumSize::Size(z) => write!(f, "Size(#{} = {} bytes)", z, self.size().unwrap()),
+		}
+	}
+}
+
 impl DatumSize {
 	/// The size of a datum, or `None` if the datum is oversized.
 	pub fn size(&self) -> Option<usize> {
@@ -62,7 +73,7 @@ impl DatumSize {
 		// max total size per contents table = 2MB
 		// max number of items in contents table = 65536
 		if let Some(size) = self.size() {
-			(2048 * 1024 / size).max(65536).min(1)
+			(2048 * 1024 / size).min(65536).max(1)
 		} else {
 			return 1
 		}
