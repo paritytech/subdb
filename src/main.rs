@@ -1,15 +1,35 @@
 use std::path::PathBuf;
 use log::info;
 
+mod content;
 mod datum_size;
 mod database;
+mod index;
 mod index_item;
 mod table;
 mod types;
 
 pub use database::{Database, Options};
 
-// TODO: Adaptive index size (bitwise increase).
+/// Error type.
+// TODO: Repot.
+
+#[derive(Debug, derive_more::Display, derive_more::From)]
+pub enum Error {
+	/// An I/O error.
+	#[display(fmt="I/O error: {}", _0)]
+	Io(std::io::Error),
+
+	/// Metadata is bad.
+	#[display(fmt="Bad metadata")]
+	BadMetadata,
+
+	/// Unsupported version.
+	#[display(fmt="Unsupported version")]
+	UnsupportedVersion,
+}
+impl std::error::Error for Error {}
+
 // DONE: Better format for index n-bytes up to 4 bytes rest-of-key, 16-bit location-correction, 8-
 //       bit skipped counter.
 //       - for 0-7 bit table (1 - 128 entries), then 4 bytes rest-of-key.
@@ -21,10 +41,12 @@ pub use database::{Database, Options};
 //       Then 8-bit for skipped-counter (256 positions, which is the number of items following
 //       this position which would have been indexed here but had to skip over this position because
 //       it was already taken.
-// TODO: Oversize content tables.
-// TODO: Content tables should be able to grow.
-// TODO: Versioning.
+// DONE: Versioning.
 // DONE: Remove items.
+// TODO: Adaptive index size (bitwise increase).
+// TODO: Content tables should be able to grow.
+// TODO: Oversize content tables.
+// TODO: Stored friend links.
 
 fn main() {
 	simplelog::CombinedLogger::init(
@@ -44,7 +66,7 @@ fn main() {
 			.path(path.clone())
 			.open::<Key>()
 			.unwrap();
-		db.put(b"Hello world!")
+		db.insert(b"Hello world!", None).1
 	};
 
 	{
