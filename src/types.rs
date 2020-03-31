@@ -9,6 +9,10 @@ pub trait KeyType: AsRef<[u8]> + AsMut<[u8]> + Encode + Decode + Eq + PartialEq 
 	fn from_data(data: &[u8]) -> Self;
 }
 
+pub trait EncodedSize: Encode {
+	fn encoded_size() -> usize;
+}
+
 macro_rules! do_array {
 	($n:tt $( $rest:tt )*) => {
 		impl KeyType for [u8; $n] {

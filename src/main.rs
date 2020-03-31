@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use log::info;
 
 mod content;
+mod content_address;
 mod datum_size;
 mod database;
 mod index;

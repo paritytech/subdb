@@ -5,7 +5,7 @@ use log::{info, trace};
 use crate::datum_size::DatumSize;
 use crate::types::KeyType;
 use crate::content::Content;
-use crate::index_item::ContentAddress;
+use crate::content_address::ContentAddress;
 use crate::table::{RefCount, TableItemCount};
 use crate::index::Index;
 use crate::Error;
@@ -70,7 +70,7 @@ impl Options {
 pub struct Database<K: KeyType> {
 	#[allow(dead_code)]
 	path: PathBuf,
-	index: Index<K>,
+	index: Index<K, ContentAddress>,
 	content: Content<K>,
 	_dummy: std::marker::PhantomData<K>,
 }

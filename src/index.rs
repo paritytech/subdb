@@ -1,17 +1,16 @@
 use std::path::PathBuf;
 use std::fs::{File, OpenOptions};
+use std::fmt::Debug;
 use memmap::MmapMut;
-use parity_scale_codec::Decode;
+use parity_scale_codec::{Codec, Decode};
 use smallvec::SmallVec;
 use log::trace;
 
-use crate::types::{KeyType, SimpleWriter};
-use crate::index_item::{IndexItem, IndexEntry, ContentAddress};
+use crate::types::{KeyType, SimpleWriter, EncodedSize};
+use crate::index_item::{IndexItem, IndexEntry};
 use crate::Error;
 
-// TODO: make generic over ContentAddress
-
-pub struct Index<K: KeyType> {
+pub struct Index<K, V> {
 	#[allow(dead_code)]
 	file: File,
 	index: MmapMut,
@@ -23,17 +22,22 @@ pub struct Index<K: KeyType> {
 
 	item_count: usize,
 	item_size: usize,
-	_dummy: std::marker::PhantomData<K>,
+	_dummy: std::marker::PhantomData<(K, V)>,
 }
 
-impl<K: KeyType> Drop for Index<K> {
+impl<K, V> Drop for Index<K, V> {
 	fn drop(&mut self) {
 		self.commit();
 	}
 }
 
-impl<K: KeyType> Index<K> {
+impl<K, V> Index<K, V> {
+	pub fn commit(&mut self) {
+		self.index.flush().expect("Flush errored?");
+	}
+}
 
+impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 	/// Open a database if it already exists and create a new one if not.
 	pub fn open(filename: PathBuf, key_bytes: usize, index_bits: usize) -> Result<Self, Error> {
 		let file = OpenOptions::new()
@@ -46,7 +50,7 @@ impl<K: KeyType> Index<K> {
 		let index_full_bytes = index_bits / 8;
 		let suffix_len = key_bytes - index_full_bytes;
 		let index_mask = ((1u128 << index_bits as u128) - 1) as usize;
-		let item_size = 2 + 1 + 4 + suffix_len;
+		let item_size = 2 + 1 + V::encoded_size() + suffix_len;
 		let item_count = 1 << index_bits;
 
 		file.set_len((item_count * item_size) as u64).expect("Path must be writable.");
@@ -60,12 +64,8 @@ impl<K: KeyType> Index<K> {
 		})
 	}
 
-	pub fn commit(&mut self) {
-		self.index.flush().expect("Flush errored?");
-	}
-
 	/// Alters an index item in the index table store according to the given `f` function.
-	fn mutate_item<R>(&mut self, index: usize, f: impl FnOnce(&mut IndexItem) -> R) -> R {
+	fn mutate_item<R>(&mut self, index: usize, f: impl FnOnce(&mut IndexItem<V>) -> R) -> R {
 		let data = &mut self.index[index * self.item_size..(index + 1) * self.item_size];
 		let mut entry = IndexItem::decode(&mut &data[..], self.suffix_len)
 			.expect("Database corrupted?!");
@@ -75,7 +75,7 @@ impl<K: KeyType> Index<K> {
 	}
 
 	/// Reads and returns an index item from the index table store.
-	fn read_item(&self, index: usize) -> IndexItem {
+	fn read_item(&self, index: usize) -> IndexItem<V> {
 		let data = &self.index[index * self.item_size..(index + 1) * self.item_size];
 		let r = IndexItem::decode(&mut &data[..], self.suffix_len).expect("Database corrupted?!");
 		trace!(target: "index", "read_item({}): {} -> {:?}", index, hex::encode(data), r);
@@ -83,7 +83,7 @@ impl<K: KeyType> Index<K> {
 	}
 
 	/// Writes a given index item to the index table store.
-	fn write_item(&mut self, index: usize, entry: IndexItem) {
+	fn write_item(&mut self, index: usize, entry: IndexItem<V>) {
 		let data = &mut self.index[index * self.item_size..(index + 1) * self.item_size];
 		entry.encode_to(&mut SimpleWriter(data, 0), self.suffix_len);
 		trace!(target: "index", "write_item({}): {:?} -> {}", index, entry, hex::encode(data));
@@ -109,7 +109,7 @@ impl<K: KeyType> Index<K> {
 	pub fn with_item_try<R>(
 		&self,
 		hash: &K,
-		mut f: impl FnMut(IndexEntry) -> Result<R, ()>
+		mut f: impl FnMut(IndexEntry<V>) -> Result<R, ()>
 	) -> Option<R> {
 		let (mut index, suffix) = self.index_suffix_of(hash);
 		trace!(target: "index", "Finding item; primary index {}; suffix: {:?}", index, suffix);
@@ -139,7 +139,7 @@ impl<K: KeyType> Index<K> {
 	pub fn edit_in<R>(
 		&mut self,
 		hash: &K,
-		mut f: impl FnMut(Option<&ContentAddress>) -> Result<(Option<ContentAddress>, R), ()>,
+		mut f: impl FnMut(Option<&V>) -> Result<(Option<V>, R), ()>,
 	) -> R {
 		let (primary_index, key_suffix) = self.index_suffix_of(hash);
 		let mut key_correction = 0;
@@ -192,7 +192,7 @@ impl<K: KeyType> Index<K> {
 	pub fn edit_out<R>(
 		&mut self,
 		hash: &K,
-		mut if_maybe_found: impl FnMut(ContentAddress) -> Result<(Option<Option<ContentAddress>>, R), ()>,
+		mut if_maybe_found: impl FnMut(V) -> Result<(Option<Option<V>>, R), ()>,
 	) -> Result<R, ()> {
 		let (primary_index, suffix) = self.index_suffix_of(hash);
 		let mut try_index = primary_index;

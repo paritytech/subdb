@@ -1,10 +1,8 @@
 use std::path::PathBuf;
 
 use crate::datum_size::DatumSize;
-use crate::types::{
-	KeyType, EntryIndex, TableIndex
-};
-use crate::index_item::ContentAddress;
+use crate::types::{KeyType, EntryIndex, TableIndex};
+use crate::content_address::ContentAddress;
 use crate::table::{Table, TableItemIndex, RefCount, TableItemCount};
 use crate::Error;
 
