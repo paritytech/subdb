@@ -10,8 +10,6 @@ use crate::table::{RefCount, TableItemCount};
 use crate::index::Index;
 use crate::Error;
 
-//mod reindex;
-
 /// The options builder.
 pub struct Options {
 	path: PathBuf,
@@ -20,7 +18,51 @@ pub struct Options {
 }
 
 type Version = u32;
+
 const CURRENT_VERSION: Version = 1;
+
+#[derive(Encode, Decode)]
+struct MetadataV1 {
+	#[codec(encoded_as(u32))]
+	key_bytes: u32,
+	#[codec(encoded_as(u32))]
+	index_bits: u32,
+}
+
+impl Metadata for MetadataV1 {}
+
+trait Metadata: Encode + Decode {
+	fn filename(path: &PathBuf) -> PathBuf {
+		let mut filename = path.clone();
+		filename.push("metadata.subdb");
+		filename
+	}
+
+	fn write(&self, path: &PathBuf) -> Result<(), Error> {
+		(b"SBDB", CURRENT_VERSION, &self)
+			.using_encoded(|e| std::fs::write(Self::filename(path), e))?;
+		Ok(())
+	}
+
+	fn try_read(path: &PathBuf) -> Result<Option<Self>, Error> {
+		let filename = Self::filename(path);
+		if !filename.is_file() {
+			return Ok(None);
+		}
+		let metadata = std::fs::read(Self::filename(path))?;
+		let mut input = &metadata[..];
+
+		let magic = <[u8; 4]>::decode(&mut input).map_err(|_| Error::BadMetadata)?;
+		if &magic != b"SBDB" {
+			return Err(Error::BadMetadata);
+		}
+		let version = Version::decode(&mut input).map_err(|_| Error::BadMetadata)?;
+		if version != CURRENT_VERSION {
+			return Err(Error::UnsupportedVersion);
+		}
+		Ok(Some(Self::decode(&mut input).map_err(|_| Error::BadMetadata)?))
+	}
+}
 
 impl Options {
 	/// Create a new instance.
@@ -89,46 +131,17 @@ impl<K: KeyType> Database<K> {
 			std::fs::create_dir_all(path.clone())?;
 		}
 
-		{
-			// Sort out metadata.
-			let mut metadata_filename = path.clone();
-			metadata_filename.push("metadata.subdb");
-			let already_existed = metadata_filename.is_file();
-
-			#[derive(Encode, Decode)]
-			struct MetadataV1 {
-				key_bytes: u32,
-				index_bits: u32,
-			}
-
-			if already_existed {
-				// Read metadata.
-				let metadata = std::fs::read(metadata_filename)?;
-				let mut input = &metadata[..];
-
-				let magic = <[u8; 4]>::decode(&mut input).map_err(|_| Error::BadMetadata)?;
-				if &magic != b"SBDB" {
-					return Err(Error::BadMetadata);
-				}
-				let version = Version::decode(&mut input).map_err(|_| Error::BadMetadata)?;
-				if version != CURRENT_VERSION {
-					return Err(Error::UnsupportedVersion);
-				}
-				let fields = MetadataV1::decode(&mut input).map_err(|_| Error::BadMetadata)?;
-				key_bytes = fields.key_bytes as usize;
-				index_bits = fields.index_bits as usize;
-
-				info!("Opening existing SubDB [{} bytes/{}-bit]", key_bytes, index_bits);
-			} else {
-				// Write metadata.
-				let fields = MetadataV1 {
-					key_bytes: key_bytes as u32,
-					index_bits: index_bits as u32,
-				};
-				(b"SBDB", CURRENT_VERSION, fields)
-					.using_encoded(|e| std::fs::write(metadata_filename, e))?;
-				info!("Creating new SubDB [{} bytes/{}-bit]", key_bytes, index_bits);
-			}
+		// Sort out metadata.
+		if let Some(fields) = MetadataV1::try_read(&path)? {
+			key_bytes = fields.key_bytes as usize;
+			index_bits = fields.index_bits as usize;
+			info!("Opening existing SubDB [{} bytes/{}-bit]", key_bytes, index_bits);
+		} else {
+			MetadataV1 {
+				key_bytes: key_bytes as u32,
+				index_bits: index_bits as u32,
+			}.write(&path);
+			info!("Creating new SubDB [{} bytes/{}-bit]", key_bytes, index_bits);
 		}
 
 		let mut index_filename = path.clone();
@@ -140,6 +153,37 @@ impl<K: KeyType> Database<K> {
 		Ok(Self {
 			path, index, content, _dummy: Default::default()
 		})
+	}
+
+	pub fn reindex(&mut self, key_bytes: usize, index_bits: usize) -> Result<(), Error> {
+		let mut temp_filename = self.path.clone();
+		temp_filename.push("new-index.subdb");
+
+		let mut index_filename = self.path.clone();
+		index_filename.push("index.subdb");
+
+		// First we create the new index.
+		// We don't want to keep it around as we'll be renaming it and need it to be closed.
+		Index::from_existing(temp_filename.clone(), &mut self.index, key_bytes, index_bits)?;
+
+		// Then, we cunningly close `self.index` by replacing it with a dummy.
+		self.index = Index::anonymous(1, 1)?;
+
+		// Then, we remove the old version and rename the new version.
+		std::fs::remove_file(index_filename.clone());
+		std::fs::rename(temp_filename, index_filename.clone());
+		// ...and reset the metadata.
+		MetadataV1 {
+			key_bytes: key_bytes as u32,
+			index_bits: index_bits as u32,
+		}.write(&self.path);
+		info!("Creating new SubDB [{} bytes/{}-bit]", key_bytes, index_bits);
+
+
+		// Finally, we reopen it replacing the dummy.
+		self.index = Index::open(index_filename, key_bytes, index_bits)?;
+
+		Ok(())
 	}
 
 	pub fn commit(&mut self) {

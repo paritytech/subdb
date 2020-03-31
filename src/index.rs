@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::fs::{File, OpenOptions};
 use std::fmt::Debug;
+use std::convert::TryInto;
 use memmap::MmapMut;
 use parity_scale_codec::{Codec, Decode};
 use smallvec::SmallVec;
@@ -11,13 +12,14 @@ use crate::index_item::{IndexItem, IndexEntry};
 use crate::Error;
 
 pub struct Index<K, V> {
-	#[allow(dead_code)]
-	file: File,
+//	#[allow(dead_code)]
+//	file: File,
 	index: MmapMut,
 
 	suffix_len: usize,
 	key_bytes: usize,
 	index_mask: usize,
+	index_bits: usize,
 	index_full_bytes: usize,
 
 	item_count: usize,
@@ -59,8 +61,24 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 		};
 
 		Ok(Self {
-			index, file, key_bytes, suffix_len, index_mask,
-			index_full_bytes, item_size, item_count, _dummy: Default::default()
+			index, key_bytes, suffix_len, index_mask,
+			index_bits, index_full_bytes, item_size, item_count, _dummy: Default::default()
+		})
+	}
+
+	/// Open a database if it already exists and create a new one if not.
+	pub fn anonymous(key_bytes: usize, index_bits: usize) -> Result<Self, Error> {
+		let index_full_bytes = index_bits / 8;
+		let suffix_len = key_bytes - index_full_bytes;
+		let index_mask = ((1u128 << index_bits as u128) - 1) as usize;
+		let item_size = 2 + 1 + V::encoded_size() + suffix_len;
+		let item_count = 1 << index_bits;
+
+		let index = MmapMut::map_anon(item_count * item_size).expect("Out of memory?");
+
+		Ok(Self {
+			index, key_bytes, suffix_len, index_mask,
+			index_bits, index_full_bytes, item_size, item_count, _dummy: Default::default()
 		})
 	}
 
@@ -91,10 +109,35 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 
 	/// Determines the `index` (first location where it should be found in the index table) and
 	/// the `key_suffix` for a given key `hash`.
-	fn index_suffix_of(&self, hash: &K) -> (usize, SmallVec<[u8; 4]>) {
-		let index = u64::decode(&mut hash.as_ref())
-			.expect("Hash must be at least a u64") as usize;
-		(index & self.index_mask, hash.as_ref()[self.index_full_bytes..self.key_bytes].into())
+	///
+	/// It's up to the caller to ensure that `hash` is big enough. It needs to be both at least
+	/// `self.key_bytes` and at least the next power of two from the `index_bits` divided by 8.
+	/// If the `hash.len()` is at least 8 then you'll probably be fine.
+	fn index_suffix_of(&self, hash: &[u8]) -> (usize, SmallVec<[u8; 4]>) {
+		let index = match self.index_bits {
+			0 => 0,
+			1..=8 => hash[0] as usize,
+			9..=16 => u16::from_le_bytes(hash.try_into().expect("hash len must be >=2")) as usize,
+			17..=32 => u32::from_le_bytes(hash.try_into().expect("hash len must be >=4")) as usize,
+			32..=64 => u64::from_le_bytes(hash.try_into().expect("hash len must be >=8")) as usize,
+			_ => unimplemented!("Too big an index!"),
+		};
+		(index & self.index_mask, hash[self.index_full_bytes..self.key_bytes].into())
+	}
+
+	/// Determines the first part of the hash/key from the index and the key-suffix. A partial
+	/// reversion of `index_suffix_of`.
+	fn key_prefix(&self, index: usize, suffix: &[u8]) -> SmallVec<[u8; 8]> {
+		let mut prefix: SmallVec<[u8; 8]> = match self.index_full_bytes {
+			0 => SmallVec::new(),
+			1 => (index as u8).to_le_bytes().as_ref()[..self.index_full_bytes].into(),
+			2 => (index as u16).to_le_bytes().as_ref()[..self.index_full_bytes].into(),
+			3 | 4 => (index as u32).to_le_bytes().as_ref()[..self.index_full_bytes].into(),
+			5 | 6 | 7 | 8 => (index as u64).to_le_bytes().as_ref()[..self.index_full_bytes].into(),
+			_ => unimplemented!("Too big an index!"),
+		};
+		prefix.extend_from_slice(suffix);
+		prefix
 	}
 
 	/// Attempt to run a function `f` on the probable `IndexEntry` found which represents the
@@ -111,7 +154,7 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 		hash: &K,
 		mut f: impl FnMut(IndexEntry<V>) -> Result<R, ()>
 	) -> Option<R> {
-		let (mut index, suffix) = self.index_suffix_of(hash);
+		let (mut index, suffix) = self.index_suffix_of(hash.as_ref());
 		trace!(target: "index", "Finding item; primary index {}; suffix: {:?}", index, suffix);
 		for correction in 0.. {
 			let item = self.read_item(index);
@@ -141,7 +184,16 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 		hash: &K,
 		mut f: impl FnMut(Option<&V>) -> Result<(Option<V>, R), ()>,
 	) -> R {
-		let (primary_index, key_suffix) = self.index_suffix_of(hash);
+		let (primary_index, key_suffix) = self.index_suffix_of(hash.as_ref());
+		self.edit_in_position(primary_index, key_suffix, f)
+	}
+
+	fn edit_in_position<R>(
+		&mut self,
+		primary_index: usize,
+		key_suffix: SmallVec<[u8; 4]>,
+		mut f: impl FnMut(Option<&V>) -> Result<(Option<V>, R), ()>,
+	) -> R {
 		let mut key_correction = 0;
 		let mut try_index = primary_index;
 		trace!(target: "index", "    Primary index {:?}", try_index);
@@ -194,7 +246,7 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 		hash: &K,
 		mut if_maybe_found: impl FnMut(V) -> Result<(Option<Option<V>>, R), ()>,
 	) -> Result<R, ()> {
-		let (primary_index, suffix) = self.index_suffix_of(hash);
+		let (primary_index, suffix) = self.index_suffix_of(hash.as_ref());
 		let mut try_index = primary_index;
 		trace!(target: "index", "Removing item; primary index {}; suffix: {:?}", try_index, suffix);
 		for correction in 0.. {
@@ -235,5 +287,36 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 			try_index = (try_index + 1) % self.item_count;
 		}
 		unreachable!()
+	}
+
+	pub fn from_existing(filename: PathBuf, source: &Self, key_bytes: usize, index_bits: usize) -> Result<Self, Error> {
+		// Open new index.
+		let mut result = Index::open(filename, key_bytes, index_bits)?;
+
+		if key_bytes <= source.key_bytes {
+			for i in 0..source.item_count {
+				let item = source.read_item(i);
+				if let Some(mut entry) = item.maybe_entry {
+					let index = (i + source.item_count - entry.key_correction) % source.item_count;
+					let mut partial_key = source.key_prefix(index, &entry.key_suffix);
+					// we put zeros on the end since they won't affect LE representations and we extend
+					// in order to guarantee that it's big enough for `index_suffix_of`.
+					assert!(partial_key.len() >= result.key_bytes);
+					partial_key.resize(8, 0);
+					let (index, key_suffix) = result.index_suffix_of(partial_key.as_ref());
+					let mut the_address = Some(entry.address);
+					result.edit_in_position(index & result.index_mask, key_suffix, |maybe_same| {
+						if maybe_same.is_some() {
+							Err(())
+						} else {
+							Ok((Some(the_address.take().expect("This branch can only be called once")), ()))
+						}
+					});
+				}
+			}
+		} else {
+			unimplemented!();
+		}
+		Ok(result)
 	}
 }

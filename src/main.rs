@@ -62,7 +62,7 @@ fn main() {
 	type Key = [u8; 8];
 	let key = {
 		let mut db = Options::new()
-			.key_bytes(1)
+			.key_bytes(2)
 			.index_bits(4)
 			.path(path.clone())
 			.open::<Key>()
@@ -79,6 +79,13 @@ fn main() {
 
 		let value = db.get(&Default::default());
 		println!("Empty value: {:?}", value);
+
+		println!("Reindexing...");
+		db.reindex(2, 8);
+
+		let value = db.get(&key);
+		println!("Value: {:?}", value.and_then(|b| String::from_utf8(b).ok()));
+		println!("Refs: {}", db.get_ref_count(&key));
 
 		info!("Info: {:?}", db.info());
 
