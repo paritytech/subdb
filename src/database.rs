@@ -8,60 +8,16 @@ use crate::content::Content;
 use crate::content_address::ContentAddress;
 use crate::table::{RefCount, TableItemCount};
 use crate::index::Index;
+use crate::metadata::{Metadata, MetadataV1};
 use crate::Error;
 
 /// The options builder.
 pub struct Options {
-	path: PathBuf,
-	key_bytes: usize,
-	index_bits: usize,
-}
-
-type Version = u32;
-
-const CURRENT_VERSION: Version = 1;
-
-#[derive(Encode, Decode)]
-struct MetadataV1 {
-	#[codec(encoded_as(u32))]
-	key_bytes: u32,
-	#[codec(encoded_as(u32))]
-	index_bits: u32,
-}
-
-impl Metadata for MetadataV1 {}
-
-trait Metadata: Encode + Decode {
-	fn filename(path: &PathBuf) -> PathBuf {
-		let mut filename = path.clone();
-		filename.push("metadata.subdb");
-		filename
-	}
-
-	fn write(&self, path: &PathBuf) -> Result<(), Error> {
-		(b"SBDB", CURRENT_VERSION, &self)
-			.using_encoded(|e| std::fs::write(Self::filename(path), e))?;
-		Ok(())
-	}
-
-	fn try_read(path: &PathBuf) -> Result<Option<Self>, Error> {
-		let filename = Self::filename(path);
-		if !filename.is_file() {
-			return Ok(None);
-		}
-		let metadata = std::fs::read(Self::filename(path))?;
-		let mut input = &metadata[..];
-
-		let magic = <[u8; 4]>::decode(&mut input).map_err(|_| Error::BadMetadata)?;
-		if &magic != b"SBDB" {
-			return Err(Error::BadMetadata);
-		}
-		let version = Version::decode(&mut input).map_err(|_| Error::BadMetadata)?;
-		if version != CURRENT_VERSION {
-			return Err(Error::UnsupportedVersion);
-		}
-		Ok(Some(Self::decode(&mut input).map_err(|_| Error::BadMetadata)?))
-	}
+	pub(crate) path: PathBuf,
+	pub(crate) key_bytes: usize,
+	pub(crate) index_bits: usize,
+	pub(crate) skipped_count_trigger: u8,
+	pub(crate) key_correction_trigger: usize,
 }
 
 impl Options {
@@ -70,17 +26,15 @@ impl Options {
 		Self {
 			key_bytes: 4,
 			index_bits: 16,
+			skipped_count_trigger: 1,
+			key_correction_trigger: 1,
 			path: Default::default(),
 		}
 	}
 
 	/// Create a new instance, providing a path.
 	pub fn from_path(path: PathBuf) -> Self {
-		Self {
-			key_bytes: 4,
-			index_bits: 16,
-			path
-		}
+		Self::new().path(path)
 	}
 
 	/// Set the number of bytes to use for the index key (default: 4).
@@ -105,13 +59,12 @@ impl Options {
 
 	/// Open the database or create one with the configured options if it doesn't yet exist.
 	pub fn open<K: KeyType>(self) -> Result<Database<K>, Error> {
-		Database::open(self.path, self.key_bytes, self.index_bits)
+		Database::open(self)
 	}
 }
 
 pub struct Database<K: KeyType> {
-	#[allow(dead_code)]
-	path: PathBuf,
+	options: Options,
 	index: Index<K, ContentAddress>,
 	content: Content<K>,
 	_dummy: std::marker::PhantomData<K>,
@@ -125,41 +78,43 @@ impl<K: KeyType> Drop for Database<K> {
 
 impl<K: KeyType> Database<K> {
 	/// Open a database if it already exists and create a new one if not.
-	pub fn open(path: PathBuf, mut key_bytes: usize, mut index_bits: usize) -> Result<Self, Error> {
-		assert!(!path.is_file(), "Path must be a directory or not exist.");
-		if !path.is_dir() {
-			std::fs::create_dir_all(path.clone())?;
+	pub fn open(options: Options) -> Result<Self, Error> {
+		assert!(!options.path.is_file(), "Path must be a directory or not exist.");
+		if !options.path.is_dir() {
+			std::fs::create_dir_all(options.path.clone())?;
 		}
 
 		// Sort out metadata.
-		if let Some(fields) = MetadataV1::try_read(&path)? {
-			key_bytes = fields.key_bytes as usize;
-			index_bits = fields.index_bits as usize;
-			info!("Opening existing SubDB [{} bytes/{}-bit]", key_bytes, index_bits);
+		let metadata = if let Some(metadata) = MetadataV1::try_read(&options.path)? {
+			info!("Opening existing SubDB [{} bytes/{}-bit]", metadata.key_bytes, metadata.index_bits);
+			metadata
 		} else {
-			MetadataV1 {
-				key_bytes: key_bytes as u32,
-				index_bits: index_bits as u32,
-			}.write(&path);
-			info!("Creating new SubDB [{} bytes/{}-bit]", key_bytes, index_bits);
-		}
+			let metadata = MetadataV1::from(&options);
+			metadata.write(&options.path);
+			info!("Creating new SubDB [{} bytes/{}-bit]", metadata.key_bytes, metadata.index_bits);
+			metadata
+		};
 
-		let mut index_filename = path.clone();
+		let mut index_filename = options.path.clone();
 		index_filename.push("index.subdb");
-		let index = Index::open(index_filename, key_bytes, index_bits)?;
+		let index = Index::open(
+			index_filename,
+			metadata.key_bytes,
+			metadata.index_bits
+		)?;
 
-		let content = Content::open(path.clone())?;
+		let content = Content::open(options.path.clone())?;
 
 		Ok(Self {
-			path, index, content, _dummy: Default::default()
+			options, index, content, _dummy: Default::default()
 		})
 	}
 
 	pub fn reindex(&mut self, key_bytes: usize, index_bits: usize) -> Result<(), Error> {
-		let mut temp_filename = self.path.clone();
+		let mut temp_filename = self.options.path.clone();
 		temp_filename.push("new-index.subdb");
 
-		let mut index_filename = self.path.clone();
+		let mut index_filename = self.options.path.clone();
 		index_filename.push("index.subdb");
 
 		// First we create the new index.
@@ -173,10 +128,7 @@ impl<K: KeyType> Database<K> {
 		std::fs::remove_file(index_filename.clone());
 		std::fs::rename(temp_filename, index_filename.clone());
 		// ...and reset the metadata.
-		MetadataV1 {
-			key_bytes: key_bytes as u32,
-			index_bits: index_bits as u32,
-		}.write(&self.path);
+		MetadataV1 { key_bytes, index_bits }.write(&self.options.path);
 		info!("Creating new SubDB [{} bytes/{}-bit]", key_bytes, index_bits);
 
 
@@ -210,22 +162,46 @@ impl<K: KeyType> Database<K> {
 			std::str::from_utf8(data).map_or_else(|_| hex::encode(data), |s| s.to_owned())
 		);
 		let hash = hash.unwrap_or_else(|| K::from_data(data));
-		let content = &mut self.content;
-		let r = self.index.edit_in(
-			&hash,
-			|maybe_entry: Option<&ContentAddress>| -> Result<(Option<ContentAddress>, RefCount), ()> {
-				if let Some(address) = maybe_entry {
-					// Same item (almost certainly) - just need to bump the ref count on the
-					// data.
-					// We check that this is actually the right item, though.
-					content.bump(address, Some(&hash))
-						.map(|r| { trace!(target: "index", "Bumped."); (None, r) })
-				} else {
-					// Nothing there - insert the new item.
-					Ok((Some(content.emplace(&hash, data)), 1))
+		let r = loop {
+			match {
+				let content = &mut self.content;
+				self.index.edit_in(
+					&hash,
+					|maybe_entry: Option<&ContentAddress>| -> Result<(Option<ContentAddress>, RefCount), ()> {
+						if let Some(address) = maybe_entry {
+							// Same item (almost certainly) - just need to bump the ref count on the
+							// data.
+							// We check that this is actually the right item, though.
+							content.bump(address, Some(&hash))
+								.map(|r| {
+									trace!(target: "index", "Bumped.");
+									(None, r)
+								})
+						} else {
+							// Nothing there - insert the new item.
+							Ok((Some(content.emplace(&hash, data)), 1))
+						}
+					},
+				)
+			} {
+				Ok(r) => break r,
+				Err(Error::IndexFull) => {
+					let (key_bytes, index_bits) = self.index.next_size();
+					self.reindex(key_bytes, index_bits);
 				}
-			},
-		);
+				Err(_) => unreachable!(),
+			}
+		};
+
+		let watermarks = self.index.take_watermarks();
+		if watermarks.0 > self.options.skipped_count_trigger
+			|| watermarks.1 >= self.options.key_correction_trigger
+		{
+			let (key_bytes, index_bits) = self.index.next_size();
+			info!(target: "database", "Watermark triggered. Reindexing to [{} bytes/{} bits]", key_bytes, index_bits);
+			self.reindex(key_bytes, index_bits);
+		}
+
 		(r, hash)
 	}
 

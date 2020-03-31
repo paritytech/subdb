@@ -67,6 +67,18 @@ impl<K: KeyType> Content<K> {
 		}
 	}
 
+	/// Get the reference count for an item, optionally checking its hash to ensure
+	/// it's the right item.
+	pub fn item_hash(&self, address: &ContentAddress) -> Result<K, ()> {
+		match address.datum_size {
+			DatumSize::Oversize => unimplemented!(),
+			DatumSize::Size(s) => {
+				self.sized_tables[s as usize][address.content_table]
+					.item_hash(address.entry_index as TableItemIndex)
+			}
+		}
+	}
+
 	/// Allocate space to store an item's contents and return its content address.
 	///
 	/// - `datum_size` is the size class of the item.

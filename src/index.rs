@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::fs::{File, OpenOptions};
+use std::fs::{OpenOptions};
 use std::fmt::Debug;
 use std::convert::TryInto;
 use memmap::MmapMut;
@@ -12,8 +12,6 @@ use crate::index_item::{IndexItem, IndexEntry};
 use crate::Error;
 
 pub struct Index<K, V> {
-//	#[allow(dead_code)]
-//	file: File,
 	index: MmapMut,
 
 	suffix_len: usize,
@@ -24,6 +22,9 @@ pub struct Index<K, V> {
 
 	item_count: usize,
 	item_size: usize,
+
+	skipped_count_watermark: u8,
+	key_correction_watermark: usize,
 	_dummy: std::marker::PhantomData<(K, V)>,
 }
 
@@ -61,7 +62,8 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 		};
 
 		Ok(Self {
-			index, key_bytes, suffix_len, index_mask,
+			index, key_bytes, suffix_len, index_mask, skipped_count_watermark: 0,
+			key_correction_watermark: 0,
 			index_bits, index_full_bytes, item_size, item_count, _dummy: Default::default()
 		})
 	}
@@ -77,7 +79,8 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 		let index = MmapMut::map_anon(item_count * item_size).expect("Out of memory?");
 
 		Ok(Self {
-			index, key_bytes, suffix_len, index_mask,
+			index, key_bytes, suffix_len, index_mask, skipped_count_watermark: 0,
+			key_correction_watermark: 0,
 			index_bits, index_full_bytes, item_size, item_count, _dummy: Default::default()
 		})
 	}
@@ -117,9 +120,9 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 		let index = match self.index_bits {
 			0 => 0,
 			1..=8 => hash[0] as usize,
-			9..=16 => u16::from_le_bytes(hash.try_into().expect("hash len must be >=2")) as usize,
-			17..=32 => u32::from_le_bytes(hash.try_into().expect("hash len must be >=4")) as usize,
-			32..=64 => u64::from_le_bytes(hash.try_into().expect("hash len must be >=8")) as usize,
+			9..=16 => u16::from_le_bytes(hash[..2].try_into().expect("hash len must be >=2")) as usize,
+			17..=32 => u32::from_le_bytes(hash[..4].try_into().expect("hash len must be >=4")) as usize,
+			32..=64 => u64::from_le_bytes(hash[..8].try_into().expect("hash len must be >=8")) as usize,
 			_ => unimplemented!("Too big an index!"),
 		};
 		(index & self.index_mask, hash[self.index_full_bytes..self.key_bytes].into())
@@ -183,7 +186,7 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 		&mut self,
 		hash: &K,
 		mut f: impl FnMut(Option<&V>) -> Result<(Option<V>, R), ()>,
-	) -> R {
+	) -> Result<R, Error> {
 		let (primary_index, key_suffix) = self.index_suffix_of(hash.as_ref());
 		self.edit_in_position(primary_index, key_suffix, f)
 	}
@@ -193,16 +196,18 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 		primary_index: usize,
 		key_suffix: SmallVec<[u8; 4]>,
 		mut f: impl FnMut(Option<&V>) -> Result<(Option<V>, R), ()>,
-	) -> R {
+	) -> Result<R, Error> {
 		let mut key_correction = 0;
 		let mut try_index = primary_index;
+		let mut skipped_count_watermark = 0;
 		trace!(target: "index", "    Primary index {:?}", try_index);
-		loop {
+		const MAX_CORRECTION: usize = 32768;
+		for i in 0..MAX_CORRECTION.min(self.item_count) {
 			let mut item = self.read_item(try_index);
 			if let Some(ref mut e) = item.maybe_entry {
 				if &e.key_suffix == &key_suffix && e.key_correction == key_correction {
 					if let Ok(result) = f(Some(&e.address)) {
-						return result.1
+						return Ok(result.1)
 					}
 				}
 			} else {
@@ -220,15 +225,26 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 					// Undo changing those skipped counts.
 					self.decrement_skip_counts(primary_index, key_correction);
 				}
-				return result;
+				return Ok(result);
 			}
 			// Collision - flag the item as skipped and continue around loop.
 			trace!(target: "index", "Collision at index {:?} with {:?}", try_index, item);
-			item.skipped_count += 1;
+
+			item.skipped_count = if let Some(n) = item.skipped_count.checked_add(1) { n } else { break };
+			self.skipped_count_watermark = self.skipped_count_watermark.max(item.skipped_count);
 			self.write_item(try_index, item);
 			key_correction += 1;
+			self.key_correction_watermark = self.key_correction_watermark.max(key_correction);
 			try_index = (try_index + 1) % self.item_count;
 		}
+
+		// If we're here, then the index must be getting full: either we've had to increment an
+		// item's skipped count too much (because it was a preferential space to more than 255 other
+		// items), or we've had to stray too many items far from the primary index (more than 32767
+		// or the number of items in the index).
+		//
+		// We will bump the size of the index and retry.
+		Err(Error::IndexFull)
 	}
 
 	fn decrement_skip_counts(&mut self, begin: usize, count: usize) {
@@ -311,12 +327,25 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 						} else {
 							Ok((Some(the_address.take().expect("This branch can only be called once")), ()))
 						}
-					});
+					})?;
 				}
 			}
 		} else {
 			unimplemented!();
 		}
 		Ok(result)
+	}
+
+	pub fn next_size(&self) -> (usize, usize) {
+		let index_bits = self.index_bits + 1;
+		let key_bytes = self.key_bytes.max((self.index_bits + 7) / 8);
+		(key_bytes, index_bits)
+	}
+
+	pub fn take_watermarks(&mut self) -> (u8, usize) {
+		let r = (self.skipped_count_watermark, self.key_correction_watermark);
+		self.skipped_count_watermark = 0;
+		self.key_correction_watermark = 0;
+		r
 	}
 }

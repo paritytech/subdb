@@ -7,13 +7,13 @@ mod datum_size;
 mod database;
 mod index;
 mod index_item;
+mod metadata;
 mod table;
 mod types;
 
 pub use database::{Database, Options};
 
 /// Error type.
-// TODO: Repot.
 
 #[derive(Debug, derive_more::Display, derive_more::From)]
 pub enum Error {
@@ -28,6 +28,10 @@ pub enum Error {
 	/// Unsupported version.
 	#[display(fmt="Unsupported version")]
 	UnsupportedVersion,
+
+	/// The index has become full.
+	#[display(fmt="Index full")]
+	IndexFull,
 }
 impl std::error::Error for Error {}
 
@@ -44,10 +48,11 @@ impl std::error::Error for Error {}
 //       it was already taken.
 // DONE: Versioning.
 // DONE: Remove items.
-// TODO: Adaptive index size (bitwise increase).
-// TODO: Content tables should be able to grow.
+// DONE: Adaptive index size (bitwise increase).
 // TODO: Oversize content tables.
+// TODO: Content tables should be able to grow.
 // TODO: Stored friend links.
+// TODO: Repot error.
 
 fn main() {
 	simplelog::CombinedLogger::init(
@@ -69,6 +74,19 @@ fn main() {
 			.unwrap();
 		db.insert(b"Hello world!", None).1
 	};
+
+	let mut number3 = Key::default();
+	{
+		let mut db = Options::from_path(path.clone()).open::<Key>().unwrap();
+		for i in 0..100 {
+			let value = format!("The number {}", i);
+			println!("👉 Inserting: {}", value);
+			let key = db.insert(value.as_bytes(), None).1;
+			if i == 3 {
+				number3 = key;
+			}
+		}
+	}
 
 	{
 		let mut db = Options::from_path(path.clone()).open::<Key>().unwrap();
@@ -97,6 +115,9 @@ fn main() {
 		let db = Options::from_path(path.clone()).open::<Key>().unwrap();
 
 		info!("Info: {:?}", db.info());
+
+		let value = db.get(&number3).and_then(|s| String::from_utf8(s).ok());
+		println!("Number3 (key: {}) is {:?}", hex::encode(number3), value);
 
 		let value = db.get(&key);
 		println!("Value: {:?}", value.and_then(|b| String::from_utf8(b).ok()));

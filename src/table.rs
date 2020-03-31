@@ -69,7 +69,7 @@ impl<K: Encode + Decode + Eq> ItemHeader<K> {
 
 	fn as_allocation(&self, check_hash: Option<&K>) -> Result<(RefCount, usize), ()> {
 		match self {
-			ItemHeader::Allocated { ref_count, size_correction, key} => {
+			ItemHeader::Allocated { ref_count, size_correction, key } => {
 				if check_hash.map_or(true, |hash| hash == key) {
 					Ok((*ref_count, *size_correction as usize))
 				} else {
@@ -77,6 +77,13 @@ impl<K: Encode + Decode + Eq> ItemHeader<K> {
 				}
 			},
 			ItemHeader::Free(_) => panic!("Allocated expected. Database corruption?"),
+		}
+	}
+
+	fn to_maybe_key(self) -> Option<K> {
+		match self {
+			ItemHeader::Allocated { key, .. } => Some(key),
+			ItemHeader::Free(_) => None,
 		}
 	}
 }
@@ -205,6 +212,11 @@ impl<K: KeyType> Table<K> {
 	/// Retrieve a table item's data as an immutable pointer.
 	pub fn item_ref_count(&self, i: TableItemIndex, check_hash: Option<&K>) -> Result<RefCount, ()> {
 		Ok(self.item_header(i).as_allocation(check_hash)?.0)
+	}
+
+	/// Retrieve a table item's key hash.
+	pub fn item_hash(&self, i: TableItemIndex) -> Result<K, ()> {
+		self.item_header(i).to_maybe_key().ok_or(())
 	}
 
 	/// Retrieve a table item's data as an immutable pointer.
