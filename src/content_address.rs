@@ -1,6 +1,5 @@
 use std::fmt;
-use smallvec::{SmallVec, smallvec};
-use parity_scale_codec::{self as codec, Encode, Decode, Codec};
+use parity_scale_codec::{self as codec, Encode, Decode};
 use crate::types::{TableIndex, EntryIndex, EncodedSize};
 use crate::datum_size::DatumSize;
 

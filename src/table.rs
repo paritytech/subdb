@@ -80,6 +80,7 @@ impl<K: Encode + Decode + Eq> ItemHeader<K> {
 		}
 	}
 
+	#[allow(dead_code)]
 	fn to_maybe_key(self) -> Option<K> {
 		match self {
 			ItemHeader::Allocated { key, .. } => Some(key),
@@ -215,6 +216,7 @@ impl<K: KeyType> Table<K> {
 	}
 
 	/// Retrieve a table item's key hash.
+	#[allow(dead_code)]
 	pub fn item_hash(&self, i: TableItemIndex) -> Result<K, ()> {
 		self.item_header(i).to_maybe_key().ok_or(())
 	}
@@ -345,21 +347,20 @@ impl<K: KeyType> Table<K> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::*;
 	use std::path::PathBuf;
 
 	#[test]
 	fn database_should_work() {
-		std::fs::remove_file("/tmp/test-table");
+		let _ = std::fs::remove_file("/tmp/test-table");
 		let x = {
 			let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into());
 			let x = t.allocate(&[42u8], 12).unwrap();
 			t.item_mut(x).copy_from_slice(b"Hello world!");
-			assert_eq!(t.item_ref(x), b"Hello world!");
+			assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
 			t.commit();
 			x
 		};
-		let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into());
-		assert_eq!(t.item_ref(x), b"Hello world!");
+		let t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into());
+		assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
 	}
 }

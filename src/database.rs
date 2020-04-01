@@ -1,6 +1,5 @@
 use std::path::PathBuf;
-use parity_scale_codec::{Encode, Decode};
-use log::{info, trace};
+use log::{info, trace, warn};
 
 use crate::datum_size::DatumSize;
 use crate::types::KeyType;
@@ -90,7 +89,7 @@ impl<K: KeyType> Database<K> {
 			metadata
 		} else {
 			let metadata = MetadataV1::from(&options);
-			metadata.write(&options.path);
+			metadata.write(&options.path)?;
 			info!("Creating new SubDB [{} bytes/{}-bit]", metadata.key_bytes, metadata.index_bits);
 			metadata
 		};
@@ -125,10 +124,10 @@ impl<K: KeyType> Database<K> {
 		self.index = Index::anonymous(1, 1)?;
 
 		// Then, we remove the old version and rename the new version.
-		std::fs::remove_file(index_filename.clone());
-		std::fs::rename(temp_filename, index_filename.clone());
+		std::fs::remove_file(index_filename.clone())?;
+		std::fs::rename(temp_filename, index_filename.clone())?;
 		// ...and reset the metadata.
-		MetadataV1 { key_bytes, index_bits }.write(&self.options.path);
+		MetadataV1 { key_bytes, index_bits }.write(&self.options.path)?;
 		info!("Creating new SubDB [{} bytes/{}-bit]", key_bytes, index_bits);
 
 
@@ -187,7 +186,7 @@ impl<K: KeyType> Database<K> {
 				Ok(r) => break r,
 				Err(Error::IndexFull) => {
 					let (key_bytes, index_bits) = self.index.next_size();
-					self.reindex(key_bytes, index_bits);
+					self.reindex(key_bytes, index_bits).expect("Fatal error");
 				}
 				Err(_) => unreachable!(),
 			}
@@ -199,7 +198,9 @@ impl<K: KeyType> Database<K> {
 		{
 			let (key_bytes, index_bits) = self.index.next_size();
 			info!(target: "database", "Watermark triggered. Reindexing to [{} bytes/{} bits]", key_bytes, index_bits);
-			self.reindex(key_bytes, index_bits);
+			if self.reindex(key_bytes, index_bits).is_err() {
+				warn!("Error while reindexing. Things will probably go badly wrong now.");
+			};
 		}
 
 		(r, hash)

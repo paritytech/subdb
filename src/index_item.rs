@@ -1,8 +1,5 @@
-use std::fmt;
 use smallvec::{SmallVec, smallvec};
 use parity_scale_codec::{self as codec, Encode, Decode, Codec};
-use crate::types::{TableIndex, EntryIndex, EncodedSize};
-use crate::datum_size::DatumSize;
 
 /// An item possibly describing an entry in this database.
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
@@ -77,15 +74,11 @@ fn index_item_encodes_decodes_correctly() {
 		maybe_entry: Some(IndexEntry {
 			key_correction: 0,
 			key_suffix: SmallVec::from(&[45][..]),
-			address: ContentAddress {
-				datum_size: DatumSize::Size(0),
-				content_table: 0,
-				entry_index: 0
-			}
+			address: 42u32,
 		}),
 	};
 	let mut encoded = Vec::<u8>::new();
-	let e = item.encode_to(&mut encoded, 1);
+	item.encode_to(&mut encoded, 1);
 	let item2 = IndexItem::decode(&mut &encoded[..], 1).unwrap();
 	assert_eq!(item, item2);
 }

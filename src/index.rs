@@ -3,7 +3,7 @@ use std::fs::{OpenOptions};
 use std::fmt::Debug;
 use std::convert::TryInto;
 use memmap::MmapMut;
-use parity_scale_codec::{Codec, Decode};
+use parity_scale_codec::Codec;
 use smallvec::SmallVec;
 use log::trace;
 
@@ -185,7 +185,7 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 	pub fn edit_in<R>(
 		&mut self,
 		hash: &K,
-		mut f: impl FnMut(Option<&V>) -> Result<(Option<V>, R), ()>,
+		f: impl FnMut(Option<&V>) -> Result<(Option<V>, R), ()>,
 	) -> Result<R, Error> {
 		let (primary_index, key_suffix) = self.index_suffix_of(hash.as_ref());
 		self.edit_in_position(primary_index, key_suffix, f)
@@ -199,10 +199,9 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 	) -> Result<R, Error> {
 		let mut key_correction = 0;
 		let mut try_index = primary_index;
-		let mut skipped_count_watermark = 0;
 		trace!(target: "index", "    Primary index {:?}", try_index);
 		const MAX_CORRECTION: usize = 32768;
-		for i in 0..MAX_CORRECTION.min(self.item_count) {
+		for _ in 0..MAX_CORRECTION.min(self.item_count) {
 			let mut item = self.read_item(try_index);
 			if let Some(ref mut e) = item.maybe_entry {
 				if &e.key_suffix == &key_suffix && e.key_correction == key_correction {
@@ -312,7 +311,7 @@ impl<K: KeyType, V: Codec + EncodedSize + Debug> Index<K, V> {
 		if key_bytes <= source.key_bytes {
 			for i in 0..source.item_count {
 				let item = source.read_item(i);
-				if let Some(mut entry) = item.maybe_entry {
+				if let Some(entry) = item.maybe_entry {
 					let index = (i + source.item_count - entry.key_correction) % source.item_count;
 					let mut partial_key = source.key_prefix(index, &entry.key_suffix);
 					// we put zeros on the end since they won't affect LE representations and we extend

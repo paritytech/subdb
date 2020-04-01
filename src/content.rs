@@ -69,6 +69,7 @@ impl<K: KeyType> Content<K> {
 
 	/// Get the reference count for an item, optionally checking its hash to ensure
 	/// it's the right item.
+	#[allow(dead_code)]
 	pub fn item_hash(&self, address: &ContentAddress) -> Result<K, ()> {
 		match address.datum_size {
 			DatumSize::Oversize => unimplemented!(),
