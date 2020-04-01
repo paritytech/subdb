@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::hash::Hasher;
 use parity_scale_codec::{Encode, Decode};
 use criterion::{Criterion, criterion_group, criterion_main, BatchSize};
@@ -36,18 +35,19 @@ fn criterion_benchmark(c: &mut Criterion) {
 		(data.into_bytes(), key)
 	}).collect::<Vec<_>>();
 
-	let new_db = || {
+	let new_db_with_index = |index_bits| {
 		let path = tempfile::TempDir::new().unwrap();
 		let db = Options::new()
 			.key_bytes(4)
-			.index_bits(24)
+			.index_bits(index_bits)
 			.path(path.as_ref().to_path_buf())
 			.open::<[u8; 32]>()
 			.unwrap();
 		(path, db)
 	};
-	
-	c.bench_function("insert 1000 (mem)", |b| {
+	let new_db = || new_db_with_index(24);
+
+	c.bench_function("insert-1k", |b| {
 		b.iter_batched(|| new_db(), |(_, mut db)| {
 			for (ref data, ref k) in keys.iter() {
 				db.insert(data.as_ref(), Some(k.clone()));
@@ -55,10 +55,79 @@ fn criterion_benchmark(c: &mut Criterion) {
 		}, BatchSize::LargeInput)
 	});
 
-	c.bench_function("remove 1000 (mem)", |b| {
+	c.bench_function("insert-1k-16bit", |b| {
+		b.iter_batched(|| new_db_with_index(16), |(_, mut db)| {
+			for (ref data, ref k) in keys.iter() {
+				db.insert(data.as_ref(), Some(k.clone()));
+			}
+		}, BatchSize::LargeInput)
+	});
+
+	c.bench_function("insert-1k-18bit", |b| {
+		b.iter_batched(|| new_db_with_index(18), |(_, mut db)| {
+			for (ref data, ref k) in keys.iter() {
+				db.insert(data.as_ref(), Some(k.clone()));
+			}
+		}, BatchSize::LargeInput)
+	});
+
+	c.bench_function("insert-1k-20bit", |b| {
+		b.iter_batched(|| new_db_with_index(20), |(_, mut db)| {
+			for (ref data, ref k) in keys.iter() {
+				db.insert(data.as_ref(), Some(k.clone()));
+			}
+		}, BatchSize::LargeInput)
+	});
+
+	c.bench_function("insert-1k-21bit", |b| {
+		b.iter_batched(|| new_db_with_index(21), |(_, mut db)| {
+			for (ref data, ref k) in keys.iter() {
+				db.insert(data.as_ref(), Some(k.clone()));
+			}
+		}, BatchSize::LargeInput)
+	});
+
+	c.bench_function("insert-1k-22bit", |b| {
+		b.iter_batched(|| new_db_with_index(22), |(_, mut db)| {
+			for (ref data, ref k) in keys.iter() {
+				db.insert(data.as_ref(), Some(k.clone()));
+			}
+		}, BatchSize::LargeInput)
+	});
+
+	c.bench_function("remove-1k", |b| {
 		b.iter_batched(|| {
 			let (path, mut db) = new_db();
 			for (ref data, ref k) in keys.iter() {
+				db.insert(data.as_ref(), Some(k.clone()));
+			}
+			(path, db)
+		}, |(_, mut db)| {
+			for (_, ref k) in keys.iter() {
+				db.remove(k).unwrap();
+			}
+		}, BatchSize::LargeInput)
+	});
+
+	c.bench_function("bump-1k", |b| {
+		b.iter_batched(|| {
+			let (path, mut db) = new_db();
+			for (ref data, ref k) in keys.iter() {
+				db.insert(data.as_ref(), Some(k.clone()));
+			}
+			(path, db)
+		}, |(_, mut db)| {
+			for (ref data, ref k) in keys.iter() {
+				db.insert(data.as_ref(), Some(k.clone()));
+			}
+		}, BatchSize::LargeInput)
+	});
+
+	c.bench_function("unbump-1k", |b| {
+		b.iter_batched(|| {
+			let (path, mut db) = new_db();
+			for (ref data, ref k) in keys.iter() {
+				db.insert(data.as_ref(), Some(k.clone()));
 				db.insert(data.as_ref(), Some(k.clone()));
 			}
 			(path, db)
