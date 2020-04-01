@@ -55,6 +55,30 @@ fn criterion_benchmark(c: &mut Criterion) {
 		}, BatchSize::LargeInput)
 	});
 
+	c.bench_function("insert-1k-12bit", |b| {
+		b.iter_batched(|| new_db_with_index(12), |(_, mut db)| {
+			for (ref data, ref k) in keys.iter() {
+				db.insert(data.as_ref(), Some(k.clone()));
+			}
+		}, BatchSize::LargeInput)
+	});
+
+	c.bench_function("insert-1k-13bit", |b| {
+		b.iter_batched(|| new_db_with_index(13), |(_, mut db)| {
+			for (ref data, ref k) in keys.iter() {
+				db.insert(data.as_ref(), Some(k.clone()));
+			}
+		}, BatchSize::LargeInput)
+	});
+
+	c.bench_function("insert-1k-14bit", |b| {
+		b.iter_batched(|| new_db_with_index(14), |(_, mut db)| {
+			for (ref data, ref k) in keys.iter() {
+				db.insert(data.as_ref(), Some(k.clone()));
+			}
+		}, BatchSize::LargeInput)
+	});
+
 	c.bench_function("insert-1k-16bit", |b| {
 		b.iter_batched(|| new_db_with_index(16), |(_, mut db)| {
 			for (ref data, ref k) in keys.iter() {

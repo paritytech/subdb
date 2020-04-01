@@ -25,8 +25,8 @@ impl Options {
 		Self {
 			key_bytes: 4,
 			index_bits: 16,
-			skipped_count_trigger: 1,
-			key_correction_trigger: 1,
+			skipped_count_trigger: 240,
+			key_correction_trigger: 32,
 			path: Default::default(),
 		}
 	}
