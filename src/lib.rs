@@ -28,7 +28,7 @@ pub use types::KeyType;
 // DONE: Versioning.
 // DONE: Remove items.
 // DONE: Adaptive index size (bitwise increase).
-// TODO: Oversize content tables.
+// DONE: Oversize content tables.
 // TODO: Content tables should be able to grow.
 // TODO: Stored friend links.
 // TODO: Remove panickers.
@@ -39,14 +39,50 @@ mod tests {
 	use log::info;
 	use std::path::PathBuf;
 
-	#[test]
-	fn general_use_should_work() {
+	fn init() {
 		simplelog::CombinedLogger::init(
 			vec![
 				simplelog::TermLogger::new(simplelog::LevelFilter::Info, simplelog::Config::default(), simplelog::TerminalMode::Mixed).unwrap(),
 			]
 		).unwrap();
+	}
 
+	#[test]
+	fn oversize_allocation_works() {
+		init();
+		let path = PathBuf::from("/tmp/test");
+		std::fs::remove_dir_all(&path).unwrap();
+
+		type Key = [u8; 8];
+		let key = {
+			let mut db = Options::new()
+				.key_bytes(2)
+				.index_bits(4)
+				.path(path.clone())
+				.open::<Key>()
+				.unwrap();
+			// Insert 1MB of zeros
+			db.insert(&[0u8; 1024*1024][..], None).1
+		};
+
+		{
+			let mut db = Options::from_path(path.clone()).open::<Key>().unwrap();
+			// Check it's there.
+			assert_eq!(db.get_ref(&key).unwrap(), &[0u8; 1024 * 1024][..]);
+			// Delete it.
+			db.remove(&key);
+		}
+
+		{
+			let db = Options::from_path(path.clone()).open::<Key>().unwrap();
+			// Check it's not there.
+			assert_eq!(db.get_ref(&key), None);
+		}
+	}
+
+	#[test]
+	fn general_use_should_work() {
+		init();
 		let path = PathBuf::from("/tmp/test");
 		std::fs::remove_dir_all(&path).unwrap();
 

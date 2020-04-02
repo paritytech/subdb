@@ -147,8 +147,11 @@ impl<K: KeyType> Database<K> {
 	}
 
 	pub fn get(&self, hash: &K) -> Option<Vec<u8>> {
+		self.get_ref(hash).map(|d| d.to_vec())
+	}
+
+	pub fn get_ref(&self, hash: &K) -> Option<&[u8]> {
 		self.index.with_item_try(hash, |entry| self.content.item_ref(&entry.address, Some(hash)))
-			.map(|d| d.to_vec())
 	}
 
 	pub fn get_ref_count(&self, hash: &K) -> RefCount {

@@ -75,15 +75,8 @@ impl DatumSize {
 		if let Some(size) = self.size() {
 			(2048 * 1024 / size).min(65536).max(1)
 		} else {
-			return 1
+			65536
 		}
-	}
-
-	/// How big should the data part of the contents file be?
-	///
-	/// `None` if the contents are oversize - in this case, it's just one item.
-	pub fn contents_size(&self) -> Option<usize> {
-		self.size().map(|s| s * self.contents_entries())
 	}
 
 	/// Total number of different sizes that are served by this. Only sensible for Sized.
