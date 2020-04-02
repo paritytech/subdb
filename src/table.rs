@@ -160,14 +160,15 @@ impl<K: KeyType> Table<K> {
 			.expect("Path must be writable.");
 		let len = file.metadata().expect("File must be readable").len();
 		let value_size = datum_size.size().unwrap_or(0);
-		let correction_factor = match datum_size.size_range().unwrap_or(0) {
-			0 => CorrectionFactor::None,
-			1..=255 => CorrectionFactor::U8,
-			256..=65535 => CorrectionFactor::U16,
-			_ => CorrectionFactor::U32,
+		let (correction_factor, correction_factor_size) = match datum_size.size_range().unwrap_or(0) {
+			0 => (CorrectionFactor::None, 0),
+			1..=255 => (CorrectionFactor::U8, 1),
+			256..=65535 => (CorrectionFactor::U16, 2),
+			_ => (CorrectionFactor::U32, 4),
 		};
 		let item_count = datum_size.contents_entries() as TableItemCount;
-		let item_header_size = size_of::<RefCount>() + size_of::<u32>() + K::SIZE.max(size_of::<TableItemIndex>());
+		let key_size = K::SIZE.max(size_of::<TableItemIndex>());
+		let item_header_size = size_of::<RefCount>() + correction_factor_size + key_size;
 		let item_size = value_size + item_header_size;
 		let table_header_size = size_of::<TableHeader>();
 		let total_size = table_header_size + item_size * item_count as usize;
@@ -253,16 +254,49 @@ impl<K: KeyType> Table<K> {
 		Some(bytes)
 	}
 
+	/// Reduce the number of items mapped until the total size is less than `maximum_size`.
+	pub fn shrink_to(&mut self, maximum_size: usize, shrink_size: usize) {
+		let mut mapped = *self.mapped.borrow();
+		if mapped > maximum_size {
+			let mut sorted = self.maps.iter()
+				.enumerate()
+				.filter_map(|(i, c)| c.borrow().as_ref().clone().map(|x| (x.1, i as TableItemIndex)))
+				.collect::<Vec<_>>();
+			sorted.sort();
+			for (_, i) in sorted.into_iter() {
+				mapped = mapped.checked_sub(self.ensure_not_mapped(i).unwrap_or(0))
+					.expect("`mapped` underflow. Database corruption?");
+				if mapped <= shrink_size {
+					break;
+				}
+			}
+		}
+	}
+
 	fn set_header(&mut self, h: TableHeader) {
 		self.header = h;
 		self.header.encode_to(&mut SimpleWriter(self.header_data.as_mut(), 0));
 	}
 
+	/// The total amount of bytes stored on disk for this table.
 	pub fn bytes_used(&self) -> usize {
 		self.data.len()
 	}
 
-	fn mutate_item_header<R>(&mut self, i: TableItemIndex, f: impl FnOnce(&mut ItemHeader<K>) -> R) -> Result<R, ()> {
+	/// The amount of bytes currently mapped into memory for this table.
+	#[allow(dead_code)]
+	pub fn bytes_mapped(&self) -> usize {
+		if self.value_size == 0 {
+			self.data.len() + *self.mapped.borrow()
+		} else {
+			self.data.len()
+		}
+	}
+
+	fn mutate_item_header<R>(&mut self,
+		i: TableItemIndex,
+		f: impl FnOnce(&mut ItemHeader<K>) -> R,
+	) -> Result<R, ()> {
 		if i as TableItemCount >= self.item_count { return Err(()) }
 		let data = &mut self.data[
 			self.item_size * i as usize..self.item_size * i as usize + self.item_header_size
@@ -435,19 +469,19 @@ impl<K: KeyType> Table<K> {
 		Ok(result)
 	}
 
-	/// The amount of slots left in this table.
+	/// The amount of slots that are occupied with data in this table.
 	#[allow(dead_code)]
 	pub fn used(&self) -> TableItemCount {
 		self.header.used
 	}
 
-	/// The amount of slots left in this table.
+	/// The total number of items that this table could ever hold at once.
 	#[allow(dead_code)]
 	pub fn total(&self) -> TableItemCount {
 		self.item_count
 	}
 
-	/// The amount of slots left in this table.
+	/// The amount of slots that are unoccupied with data in this table.
 	#[allow(dead_code)]
 	pub fn available(&self) -> TableItemCount {
 		self.item_count - self.header.used

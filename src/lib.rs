@@ -109,6 +109,40 @@ mod tests {
 	}
 
 	#[test]
+	fn oversize_allocation_shrink_works() {
+		init();
+		let path = PathBuf::from("/tmp/test");
+		let _ = std::fs::remove_dir_all(&path).unwrap();
+
+		type Key = [u8; 8];
+		let mut db = Options::new()
+			.key_bytes(2)
+			.index_bits(4)
+			.oversize_shrink(8 * 1024 * 1024, 2 * 1024 * 1024)
+			.path(path.clone())
+			.open::<Key>()
+			.unwrap();
+		let keys = (0..8).map(|i|
+			// Insert 1MB of zeros
+			db.insert(&[i; 1024 * 1024][..], None).1
+		).collect::<Vec<_>>();
+		assert_eq!(db.bytes_mapped(), 8 * 1024 * 1024 + 655360);
+
+		// Trigger shrinking.
+		let key8 = db.insert(&[8u8; 1024 * 1024][..], None).1;
+		assert_eq!(db.bytes_mapped(), 2 * 1024 * 1024 + 655360);
+
+		// Should only be 6 & 7 left now.
+		assert_eq!(db.get(&keys[7]).unwrap(), &[7u8; 1024 * 1024][..]);
+		assert_eq!(db.get(&key8).unwrap(), &[8u8; 1024 * 1024][..]);
+		assert_eq!(db.bytes_mapped(), 2 * 1024 * 1024 + 655360);
+
+		// Mapping key 0 will have to go to disk.
+		assert_eq!(db.get(&keys[0]).unwrap(), &[0u8; 1024 * 1024][..]);
+		assert_eq!(db.bytes_mapped(), 3 * 1024 * 1024 + 655360);
+	}
+
+	#[test]
 	fn general_use_should_work() {
 		init();
 		let path = PathBuf::from("/tmp/test");

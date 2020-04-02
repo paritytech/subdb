@@ -17,6 +17,8 @@ pub struct Options {
 	pub(crate) index_bits: usize,
 	pub(crate) skipped_count_trigger: u8,
 	pub(crate) key_correction_trigger: usize,
+	pub(crate) oversize_trigger_mapped: usize,
+	pub(crate) oversize_shrink_mapped: usize,
 }
 
 impl Options {
@@ -27,6 +29,8 @@ impl Options {
 			index_bits: 16,
 			skipped_count_trigger: 240,
 			key_correction_trigger: 32,
+			oversize_trigger_mapped: 256 * 1024 * 1024,
+			oversize_shrink_mapped: 64 * 1024 * 1024,
 			path: Default::default(),
 		}
 	}
@@ -53,6 +57,20 @@ impl Options {
 	/// Set the path in which the database should be opened.
 	pub fn path(mut self, path: PathBuf) -> Self {
 		self.path = path;
+		self
+	}
+
+	/// Set the oversize tables' mapping management properties. Whereas sized tables keep everything
+	/// mapped all the time, oversize tables (owing to the fact they are essentially unbounded in
+	/// how much they might be mapping) regularly prune the items that are mapped. This is done as a
+	/// simple LRU scheme where items accessed least recently will be prioritised for removal.
+	///
+	/// The system has two parameters: a `trigger` size, which is how many bytes much be mapped in
+	/// total before a "shrinking" (unmapping) happens; and a `shrink` size which is how many bytes,
+	/// at most, may continue to be mapped at the "shrinking" is completed.
+	pub fn oversize_shrink(mut self, trigger: usize, shrink: usize) -> Self {
+		self.oversize_trigger_mapped = trigger;
+		self.oversize_shrink_mapped = shrink;
 		self
 	}
 
@@ -102,7 +120,11 @@ impl<K: KeyType> Database<K> {
 			metadata.index_bits
 		)?;
 
-		let content = Content::open(options.path.clone())?;
+		let content = Content::open(
+			options.path.clone(),
+			options.oversize_trigger_mapped,
+			options.oversize_shrink_mapped
+		)?;
 
 		Ok(Self {
 			options, index, content, _dummy: Default::default()
@@ -142,7 +164,11 @@ impl<K: KeyType> Database<K> {
 		self.content.commit();
 	}
 
-	pub fn info(&self) -> Vec<((DatumSize, usize), (TableItemCount, TableItemCount, usize))> {
+	pub fn bytes_mapped(&self) -> usize {
+		self.info().into_iter().map(|x| (x.1).3).sum()
+	}
+
+	pub fn info(&self) -> Vec<((DatumSize, usize), (TableItemCount, TableItemCount, usize, usize))> {
 		self.content.info()
 	}
 

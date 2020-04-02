@@ -9,6 +9,8 @@ use crate::Error;
 pub struct Content<K: KeyType> {
 	path: PathBuf,
 	tables: Vec<Vec<Table<K>>>,
+	trigger_oversize_mapped: usize,
+	shrink_oversize_mapped: usize,
 	_dummy: std::marker::PhantomData<K>,
 }
 
@@ -96,6 +98,7 @@ impl<K: KeyType> Content<K> {
 		let s = u8::from(address.datum_size) as usize;
 		self.tables[s as usize][address.content_table]
 			.set_item(address.entry_index as TableItemIndex, data);
+		self.idle();
 		address
 	}
 
@@ -103,8 +106,10 @@ impl<K: KeyType> Content<K> {
 	/// that its key hash is the expected `check_hash`.
 	pub fn bump(&mut self, address: &ContentAddress, check_hash: Option<&K>) -> Result<RefCount, ()> {
 		let s = u8::from(address.datum_size) as usize;
-		self.tables[s as usize][address.content_table]
-			.bump(address.entry_index as TableItemIndex, check_hash)
+		let r = self.tables[s as usize][address.content_table]
+			.bump(address.entry_index as TableItemIndex, check_hash);
+		self.idle();
+		r
 	}
 
 	/// Decrement the references for an item given its content `address` and optionally checking
@@ -112,11 +117,24 @@ impl<K: KeyType> Content<K> {
 	/// storage used for the item will be freed.
 	pub fn free(&mut self, address: &ContentAddress, check_hash: Option<&K>) -> Result<RefCount, ()> {
 		let s = u8::from(address.datum_size) as usize;
-		self.tables[s as usize][address.content_table]
-			.free(address.entry_index as TableItemIndex, check_hash)
+		let r = self.tables[s as usize][address.content_table]
+			.free(address.entry_index as TableItemIndex, check_hash);
+		self.idle();
+		r
 	}
 
-	pub fn open(path: PathBuf) -> Result<Self, Error> {
+	/// Reduce the amount we have mapped in our oversize tables, if above the trigger amount.
+	pub fn idle(&mut self) {
+		for t in self.tables[63].iter_mut() {
+			t.shrink_to(self.trigger_oversize_mapped, self.shrink_oversize_mapped);
+		}
+	}
+
+	pub fn open(
+		path: PathBuf,
+		trigger_oversize_mapped: usize,
+		shrink_oversize_mapped: usize,
+	) -> Result<Self, Error> {
 		let tables = (0u8..64).map(|size| (0usize..)
 			.map(|table_index| {
 				let mut table_path = path.clone();
@@ -128,16 +146,16 @@ impl<K: KeyType> Content<K> {
 			.collect()
 		).collect();
 
-		Ok(Self { path, tables, _dummy: Default::default() })
+		Ok(Self { path, tables, trigger_oversize_mapped, shrink_oversize_mapped, _dummy: Default::default() })
 	}
 
-	pub fn info(&self) -> Vec<((DatumSize, usize), (TableItemCount, TableItemCount, usize))> {
+	pub fn info(&self) -> Vec<((DatumSize, usize), (TableItemCount, TableItemCount, usize, usize))> {
 		self.tables.iter()
 			.enumerate()
 			.map(|(z, tables)| (DatumSize::from(z as u8), tables))
 			.flat_map(|(datum_size, tables)| tables.iter()
 				.enumerate()
-				.map(|(index, table)| ((datum_size, index), (table.available(), table.used(), table.bytes_used())))
+				.map(|(index, table)| ((datum_size, index), (table.available(), table.used(), table.bytes_used(), table.bytes_mapped())))
 				.collect::<Vec<_>>()
 			)
 			.collect()
