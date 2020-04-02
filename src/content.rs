@@ -9,6 +9,7 @@ use crate::Error;
 pub struct Content<K: KeyType> {
 	path: PathBuf,
 	tables: Vec<Vec<Table<K>>>,
+	min_items_backed: TableItemCount,
 	trigger_oversize_mapped: usize,
 	shrink_oversize_mapped: usize,
 	_dummy: std::marker::PhantomData<K>,
@@ -20,7 +21,7 @@ impl<K: KeyType> Content<K> {
 		let s = <u8>::from(datum_size);
 		let table_index = self.tables[s as usize].len();
 		let table_path = self.table_path(s, table_index);
-		self.tables[s as usize].push(Table::open(table_path, datum_size));
+		self.tables[s as usize].push(Table::open(table_path, datum_size, self.min_items_backed));
 		(table_index, &mut self.tables[s as usize][table_index])
 	}
 
@@ -134,6 +135,7 @@ impl<K: KeyType> Content<K> {
 		path: PathBuf,
 		trigger_oversize_mapped: usize,
 		shrink_oversize_mapped: usize,
+		min_items_backed: TableItemCount,
 	) -> Result<Self, Error> {
 		let tables = (0u8..64).map(|size| (0usize..)
 			.map(|table_index| {
@@ -142,11 +144,11 @@ impl<K: KeyType> Content<K> {
 				table_path
 			})
 			.take_while(|table_path| table_path.is_file())
-			.map(|table_path| Table::open(table_path, DatumSize::from(size)))
+			.map(|table_path| Table::open(table_path, DatumSize::from(size), min_items_backed))
 			.collect()
 		).collect();
 
-		Ok(Self { path, tables, trigger_oversize_mapped, shrink_oversize_mapped, _dummy: Default::default() })
+		Ok(Self { path, tables, min_items_backed, trigger_oversize_mapped, shrink_oversize_mapped, _dummy: Default::default() })
 	}
 
 	pub fn info(&self) -> Vec<((DatumSize, usize), (TableItemCount, TableItemCount, usize, usize))> {

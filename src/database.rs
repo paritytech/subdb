@@ -19,6 +19,7 @@ pub struct Options {
 	pub(crate) key_correction_trigger: usize,
 	pub(crate) oversize_trigger_mapped: usize,
 	pub(crate) oversize_shrink_mapped: usize,
+	pub(crate) min_items_backed: TableItemCount,
 }
 
 impl Options {
@@ -31,6 +32,7 @@ impl Options {
 			key_correction_trigger: 32,
 			oversize_trigger_mapped: 256 * 1024 * 1024,
 			oversize_shrink_mapped: 64 * 1024 * 1024,
+			min_items_backed: 8,
 			path: Default::default(),
 		}
 	}
@@ -71,6 +73,20 @@ impl Options {
 	pub fn oversize_shrink(mut self, trigger: usize, shrink: usize) -> Self {
 		self.oversize_trigger_mapped = trigger;
 		self.oversize_shrink_mapped = shrink;
+		self
+	}
+
+	/// Set the minimum number of items that will be backed on disk. This basically sets the
+	/// minimum disk space that will be used by a table with a single element in it.
+	pub fn min_items_backed(mut self, min_items_backed: TableItemCount) -> Self {
+		self.min_items_backed = min_items_backed;
+		self
+	}
+
+	/// Ensure that the disk files never need to extend by always requiring any tables to use their
+	/// full amount.
+	pub fn all_items_backed(mut self) -> Self {
+		self.min_items_backed = 65536;
 		self
 	}
 
@@ -123,7 +139,8 @@ impl<K: KeyType> Database<K> {
 		let content = Content::open(
 			options.path.clone(),
 			options.oversize_trigger_mapped,
-			options.oversize_shrink_mapped
+			options.oversize_shrink_mapped,
+				options.min_items_backed,
 		)?;
 
 		Ok(Self {

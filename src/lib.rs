@@ -119,6 +119,7 @@ mod tests {
 			.key_bytes(2)
 			.index_bits(4)
 			.oversize_shrink(8 * 1024 * 1024, 2 * 1024 * 1024)
+			.all_items_backed()
 			.path(path.clone())
 			.open::<Key>()
 			.unwrap();

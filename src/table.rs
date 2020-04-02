@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::mem::size_of;
 use std::cell::{RefCell, RefMut};
 use memmap::{MmapMut, MmapOptions};
@@ -23,6 +23,7 @@ pub type TableItemCount = u32;
 pub type LruIndex = u64;
 
 pub struct Table<K> {
+	file: File,
 	path: PathBuf,
 	data: MmapMut,
 	header_data: MmapMut,
@@ -31,6 +32,7 @@ pub struct Table<K> {
 	item_size: usize,
 	item_count: TableItemCount,
 	value_size: usize,
+	table_header_size: usize,
 	correction_factor: CorrectionFactor,
 
 	maps: Vec<RefCell<Option<(MmapMut, LruIndex)>>>,
@@ -53,9 +55,11 @@ struct TableHeader {
 	/// Item indices equal to this and less than `item_count` may be allocated in addition to the
 	/// linked list starting at `next_free`.
 	touched_count: TableItemCount,
+	/// Total amount of bytes in all external files. Only matters when size is > 0
+	external_data: u64,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum CorrectionFactor {
 	None,
 	U8,
@@ -109,14 +113,15 @@ impl<K: Encode + Decode + Eq> ItemHeader<K> {
 	}
 
 	fn decode<I: codec::Input>(input: &mut I, correction_factor: CorrectionFactor) -> Result<Self, codec::Error> {
-		let ref_count = RefCount::decode(input)?;
-		let size_correction = match correction_factor {
-			CorrectionFactor::None => 0u32,
-			CorrectionFactor::U8 => u8::decode(input)? as u32,
-			CorrectionFactor::U16 => u16::decode(input)? as u32,
-			CorrectionFactor::U32 => u32::decode(input)?,
-		};
-		Ok(if ref_count > 0 {
+		let first_byte = input.read_byte()?;
+		Ok(if first_byte > 0 {
+			let ref_count = ((first_byte & !0b01111111) as u16) << 7 + input.read_byte()? as u16;
+			let size_correction = match correction_factor {
+				CorrectionFactor::None => 0u32,
+				CorrectionFactor::U8 => u8::decode(input)? as u32,
+				CorrectionFactor::U16 => u16::decode(input)? as u32,
+				CorrectionFactor::U32 => u32::decode(input)?,
+			};
 			Self::Allocated { ref_count, size_correction, key: K::decode(input)? }
 		} else {
 			Self::Free(TableItemIndex::decode(input)?)
@@ -126,9 +131,9 @@ impl<K: Encode + Decode + Eq> ItemHeader<K> {
 	fn encode_to<O: codec::Output>(&self, output: &mut O, correction_factor: CorrectionFactor) {
 		match self {
 			ItemHeader::Allocated { ref_count, size_correction, key} => {
-				assert!(*ref_count > 0);
-
-				ref_count.encode_to(output);
+				assert!(*ref_count < 32768);
+				(((*ref_count >> 8) | 0b10000000) as u8).encode_to(output);
+				(*ref_count as u8).encode_to(output);
 				match correction_factor {
 					CorrectionFactor::None => {},
 					CorrectionFactor::U8 => (*size_correction as u8).encode_to(output),
@@ -138,7 +143,7 @@ impl<K: Encode + Decode + Eq> ItemHeader<K> {
 				key.encode_to(output);
 			}
 			ItemHeader::Free(index) => {
-				(RefCount::default(), index).encode_to(output);
+				(0u8, index).encode_to(output);
 			}
 		}
 	}
@@ -149,7 +154,7 @@ impl<K: KeyType> Table<K> {
 		self.data.flush().expect("I/O Error");
 	}
 
-	pub fn open(path: PathBuf, datum_size: DatumSize) -> Self {
+	pub fn open(path: PathBuf, datum_size: DatumSize, min_items_backed: TableItemCount) -> Self {
 		assert!(!path.exists() || path.is_file(), "Path must either not exist or be a file.");
 
 		let file = OpenOptions::new()
@@ -166,15 +171,24 @@ impl<K: KeyType> Table<K> {
 			256..=65535 => (CorrectionFactor::U16, 2),
 			_ => (CorrectionFactor::U32, 4),
 		};
+		println!("Table size correction: {:?}/{} bytes", correction_factor, correction_factor_size);
 		let item_count = datum_size.contents_entries() as TableItemCount;
-		let key_size = K::SIZE.max(size_of::<TableItemIndex>());
-		let item_header_size = size_of::<RefCount>() + correction_factor_size + key_size;
+		let key_size = K::SIZE;
+		let item_header_size = (size_of::<RefCount>() + correction_factor_size + key_size)
+			.max(1 + size_of::<TableItemIndex>());
 		let item_size = value_size + item_header_size;
+		println!("Item size: {} bytes = rc {} + cfs {} + key {} + value {}", item_size, size_of::<RefCount>(), correction_factor_size, key_size, value_size);
 		let table_header_size = size_of::<TableHeader>();
 		let total_size = table_header_size + item_size * item_count as usize;
+		let minimum_size = table_header_size + item_size * item_count.min(min_items_backed) as usize;
 
-		assert!(len == 0 || len == total_size as u64, "File exists but length is unexpected");
-		file.set_len(total_size as u64).expect("Path must be writable.");
+		assert!(
+			len == 0 || len >= minimum_size as u64 || len <= total_size as u64,
+			"File exists but length is unexpected"
+		);
+		if len == 0 {
+			file.set_len(minimum_size as u64).expect("Path must be writable.");
+		}
 
 		let header_data = unsafe {
 			MmapOptions::new()
@@ -197,8 +211,42 @@ impl<K: KeyType> Table<K> {
 		trace!(target: "table", "Maps is now: {} items: {:?}", maps.len(), maps);
 
 		Self {
-			path, data, header_data, header, item_count, item_size, item_header_size, value_size, correction_factor,
-			maps, lru_index: RefCell::new(0), mapped: RefCell::new(0), _dummy: Default::default()
+			path, file, data, header_data, header, item_count, item_size, item_header_size, value_size, correction_factor,
+			table_header_size, maps, lru_index: RefCell::new(0), mapped: RefCell::new(0), _dummy: Default::default()
+		}
+	}
+
+	/// Extend the file, and also the amount mapped to hold twice as many items as it does currently
+	/// but no more than its maximum allowed `item_count`.
+	fn extend(&mut self, min_items: TableItemCount) {
+		self.item_count = ((self.data.len() / self.item_size * 2)
+			.min(self.item_count as usize) as TableItemCount)
+			.max(min_items);
+		self.file.set_len(self.item_count as u64 * self.item_size as u64 + self.table_header_size as u64)
+			.expect("File must be writable.");
+		self.header_data = unsafe {
+			MmapOptions::new()
+				.len(self.table_header_size)
+				.map_mut(&self.file)
+				.expect("Path must be writable.")
+		};
+		self.data = unsafe {
+			MmapOptions::new()
+				.offset(self.table_header_size as u64)
+				.map_mut(&self.file)
+				.expect("Path must be writable.")
+		};
+	}
+
+	/// Ensures that the backing file is grown sufficiently large that `index` is referencable.
+	///
+	/// This will panic if `index >= self.item_count`.
+	fn ensure_referencable(&mut self, index: TableItemIndex) {
+		let items_backed = (self.data.len() / self.item_size) as TableItemCount;
+		let index = index as TableItemCount;
+		assert!(index < self.item_count, "Oversize index. WTF?");
+		if index >= items_backed {
+			self.extend(index + 1);
 		}
 	}
 
@@ -280,7 +328,7 @@ impl<K: KeyType> Table<K> {
 
 	/// The total amount of bytes stored on disk for this table.
 	pub fn bytes_used(&self) -> usize {
-		self.data.len()
+		self.data.len() + self.header.external_data as usize
 	}
 
 	/// The amount of bytes currently mapped into memory for this table.
@@ -301,6 +349,7 @@ impl<K: KeyType> Table<K> {
 		let data = &mut self.data[
 			self.item_size * i as usize..self.item_size * i as usize + self.item_header_size
 		];
+		println!("data: {}; CF: {:?}", hex::encode(&data), self.correction_factor);
 		let mut h = ItemHeader::decode(&mut &data[..], self.correction_factor)
 			.expect("Database corrupt?");
 		let r = f(&mut h);
@@ -409,27 +458,29 @@ impl<K: KeyType> Table<K> {
 				new_next_free
 			}).ok()?;
 			h.next_free = new_next_free;
-			h.used += 1;
-			self.set_header(h);
 			result
 		} else {
 			if h.touched_count < self.item_count {
 				let result = h.touched_count as TableItemIndex;
+				self.ensure_referencable(result);
 				self.mutate_item_header(result, |item| {
 					assert!(matches!(item, ItemHeader::Free(_)), "Free slot expected. Database corrupt?");
 					*item = new_item;
 				}).ok()?;
 				h.touched_count += 1;
-				h.used += 1;
-				self.set_header(h);
 				result
 			} else {
 				return None
 			}
 		};
+		h.used += 1;
+		if self.value_size == 0 {
+			h.external_data += size as u64;
+		}
+		self.set_header(h);
 		if self.maps.len() <= result as usize {
 			let new_len = (result as usize * 3 / 2).max(self.item_count as usize);
-			self.maps.resize_with(new_len, ||RefCell::new(None));
+			self.maps.resize_with(new_len, || RefCell::new(None));
 		}
 		Some(result)
 	}
@@ -458,7 +509,11 @@ impl<K: KeyType> Table<K> {
 			if self.value_size == 0 {
 				// Actually remove the mapping and the file.
 				self.ensure_not_mapped(i);
-				std::fs::remove_file(self.contents_name(i));
+				let filename = self.contents_name(i);
+				let size = std::fs::metadata(&filename).expect("Table file missing. Database corruption?").len();
+				std::fs::remove_file(filename);
+				h.external_data = h.external_data.checked_sub(size)
+					.expect("external_data underflow. Database corruption?");
 			}
 			// Add the item to the free list.
 			h.used = h.used.checked_sub(1)
@@ -497,14 +552,14 @@ mod tests {
 	fn database_should_work() {
 		let _ = std::fs::remove_file("/tmp/test-table");
 		let x = {
-			let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into());
+			let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into(), 65536);
 			let x = t.allocate(&[42u8], 12).unwrap();
 			t.set_item(x, b"Hello world!");
 			assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
 			t.commit();
 			x
 		};
-		let t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into());
+		let t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into(), 65536);
 		assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
 	}
 
@@ -513,14 +568,49 @@ mod tests {
 		let _ = std::fs::remove_file("/tmp/test-table");
 		for i in 0..10 { let _ = std::fs::remove_file(format!("/tmp/test-table.{}", i)); }
 		let x = {
-			let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), DatumSize::Oversize);
+			let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), DatumSize::Oversize, 65536);
 			let x = t.allocate(&[42u8], 12).unwrap();
 			t.set_item(x, b"Hello world!");
 			assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
 			t.commit();
 			x
 		};
-		let t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), DatumSize::Oversize);
+		let t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), DatumSize::Oversize, 65536);
 		assert_eq!(t.item_ref(x, Some(&[42u8])).unwrap(), b"Hello world!");
+	}
+
+	#[test]
+	fn table_extension_should_work() {
+		let _ = std::fs::remove_file("/tmp/test-table");
+		let x = {
+			let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into(), 0);
+			assert_eq!(t.bytes_used(), 0);
+			let x = t.allocate(&[42u8], 12).unwrap();
+			t.set_item(x, b"Hello world!");
+			assert_eq!(t.bytes_used(), 36);
+			assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
+			t.commit();
+			x
+		};
+		let t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into(), 0);
+		assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
+	}
+
+	#[test]
+	fn oversize_table_extension_should_work() {
+		let _ = std::fs::remove_file("/tmp/test-table");
+		for i in 0..10 { let _ = std::fs::remove_file(format!("/tmp/test-table.{}", i)); }
+		let x = {
+			let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), DatumSize::Oversize, 0);
+			assert_eq!(t.bytes_used(), 0);
+			let x = t.allocate(&[42u8], 12).unwrap();
+			t.set_item(x, b"Hello world!");
+			assert_eq!(t.bytes_used(), 15);
+			assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
+			t.commit();
+			x
+		};
+		let t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), DatumSize::Oversize, 0);
+		assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
 	}
 }
