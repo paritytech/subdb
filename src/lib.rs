@@ -29,7 +29,7 @@ pub use types::KeyType;
 // DONE: Remove items.
 // DONE: Adaptive index size (bitwise increase).
 // DONE: Oversize content tables.
-// TODO: Content tables should be able to grow.
+// DONE: Content tables should be able to grow.
 // TODO: Stored friend links.
 // TODO: Remove panickers.
 // TODO: Comprehensive tests.
