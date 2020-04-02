@@ -114,9 +114,9 @@ impl<K: KeyType> Content<K> {
 			DatumSize::Oversize => unimplemented!(),
 			DatumSize::Size(s) => {
 				self.sized_tables[s as usize][address.content_table]
-					.item_mut(address.entry_index as TableItemIndex)
+					.set_item(address.entry_index as TableItemIndex, data)
 			}
-		}.copy_from_slice(data);
+		};
 		address
 	}
 

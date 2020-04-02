@@ -87,12 +87,12 @@ impl DatumSize {
 	}
 
 	/// Total number of different sizes that are served by this. Only sensible for Sized.
-	pub fn size_range(&self) -> usize {
+	pub fn size_range(&self) -> Option<usize> {
 		match *self {
-			DatumSize::Oversize => usize::max_value(),
+			DatumSize::Oversize => None,
 			DatumSize::Size(size_class) => {
 				assert!(size_class < MAX_SIZE);
-				if size_class == 0 {
+				Some(if size_class == 0 {
 					33
 				} else {
 					if size_class <= 32 {
@@ -114,7 +114,7 @@ impl DatumSize {
 							base / 4
 						}
 					}
-				}
+				})
 			}
 		}
 	}

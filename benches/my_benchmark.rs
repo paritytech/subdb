@@ -4,6 +4,8 @@ use criterion::{Criterion, criterion_group, criterion_main, BatchSize};
 use subdb::{Options, KeyType};
 use twox_hash::XxHash64;
 
+mod sizes;
+
 #[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Encode, Decode, Debug)]
 struct Xx256([u8; 32]);
 
