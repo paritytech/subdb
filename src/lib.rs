@@ -32,6 +32,7 @@ pub use types::KeyType;
 // TODO: Content tables should be able to grow.
 // TODO: Stored friend links.
 // TODO: Remove panickers.
+// TODO: Comprehensive tests.
 
 #[cfg(test)]
 mod tests {
@@ -48,10 +49,37 @@ mod tests {
 	}
 
 	#[test]
+	fn contains_key_works() {
+		init();
+		let path = PathBuf::from("/tmp/test");
+		let _ = std::fs::remove_dir_all(&path).unwrap();
+
+		type Key = [u8; 8];
+		let key = {
+			let mut db = Options::new()
+				.key_bytes(2)
+				.index_bits(4)
+				.path(path.clone())
+				.open::<Key>()
+				.unwrap();
+			// Insert 1MB of zeros
+			db.insert(b"Hello world!", None).1
+		};
+
+		{
+			let mut db = Options::from_path(path.clone()).open::<Key>().unwrap();
+			// Check it's there.
+			assert!(db.contains_key(&key));
+			db.remove(&key);
+			assert!(!db.contains_key(&key));
+		}
+	}
+
+	#[test]
 	fn oversize_allocation_works() {
 		init();
 		let path = PathBuf::from("/tmp/test");
-		std::fs::remove_dir_all(&path).unwrap();
+		let _ = std::fs::remove_dir_all(&path).unwrap();
 
 		type Key = [u8; 8];
 		let key = {
@@ -84,7 +112,7 @@ mod tests {
 	fn general_use_should_work() {
 		init();
 		let path = PathBuf::from("/tmp/test");
-		std::fs::remove_dir_all(&path).unwrap();
+		let _ = std::fs::remove_dir_all(&path).unwrap();
 
 		type Key = [u8; 8];
 		let key = {

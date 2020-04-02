@@ -151,12 +151,21 @@ impl<K: KeyType> Database<K> {
 	}
 
 	pub fn get_ref(&self, hash: &K) -> Option<&[u8]> {
-		self.index.with_item_try(hash, |entry| self.content.item_ref(&entry.address, Some(hash)))
+		self.index.with_item_try(hash, |entry|
+			self.content.item_ref(&entry.address, Some(hash))
+		)
+	}
+
+	pub fn contains_key(&self, hash: &K) -> bool {
+		self.index.with_item_try(hash, |entry|
+			if &self.content.item_hash(&entry.address)? == hash { Ok(true) } else { Err(()) }
+		).is_some()
 	}
 
 	pub fn get_ref_count(&self, hash: &K) -> RefCount {
-		self.index.with_item_try(hash, |entry| self.content.item_ref_count(&entry.address, Some(hash)))
-			.unwrap_or(0)
+		self.index.with_item_try(hash, |entry|
+			self.content.item_ref_count(&entry.address, Some(hash))
+		).unwrap_or(0)
 	}
 
 	pub fn insert(&mut self, data: &[u8], hash: Option<K>) -> (RefCount, K) {
