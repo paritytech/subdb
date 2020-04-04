@@ -96,7 +96,7 @@ mod tests {
 		{
 			let mut db = Options::from_path(path.clone()).open::<Key>().unwrap();
 			// Check it's there.
-			assert_eq!(db.get_ref(&key).unwrap(), &[0u8; 1024 * 1024][..]);
+			assert_eq!(db.get_ref(&key).unwrap().as_ref(), &[0u8; 1024 * 1024][..]);
 			// Delete it.
 			db.remove(&key);
 		}
@@ -104,7 +104,7 @@ mod tests {
 		{
 			let db = Options::from_path(path.clone()).open::<Key>().unwrap();
 			// Check it's not there.
-			assert_eq!(db.get_ref(&key), None);
+			assert!(!db.contains_key(&key));
 		}
 	}
 

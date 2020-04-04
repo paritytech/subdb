@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use parking_lot::MappedRwLockReadGuard;
 
 use crate::datum_size::DatumSize;
 use crate::types::{KeyType, EntryIndex, TableIndex};
@@ -47,7 +48,7 @@ impl<K: KeyType> Content<K> {
 
 	/// Get the raw reference to an item's content value, optionally checking its hash to ensure
 	/// it's the right item.
-	pub fn item_ref(&self, address: &ContentAddress, check_hash: Option<&K>) -> Result<&[u8], ()> {
+	pub fn item_ref(&self, address: &ContentAddress, check_hash: Option<&K>) -> Result<MappedRwLockReadGuard<&[u8]>, ()> {
 		let s = u8::from(address.datum_size) as usize;
 		self.tables[s as usize][address.content_table]
 			.item_ref(address.entry_index as TableItemIndex, check_hash)

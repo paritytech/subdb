@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use log::{info, trace, warn};
+use parking_lot::MappedRwLockReadGuard;
 
 use crate::datum_size::DatumSize;
 use crate::types::KeyType;
@@ -193,7 +194,7 @@ impl<K: KeyType> Database<K> {
 		self.get_ref(hash).map(|d| d.to_vec())
 	}
 
-	pub fn get_ref(&self, hash: &K) -> Option<&[u8]> {
+	pub fn get_ref(&self, hash: &K) -> Option<MappedRwLockReadGuard<&[u8]>> {
 		self.index.with_item_try(hash, |entry|
 			self.content.item_ref(&entry.address, Some(hash))
 		)
@@ -276,3 +277,125 @@ impl<K: KeyType> Database<K> {
 		})
 	}
 }
+/*
+use hash_db::{HashDB, PlainDB, Hasher, AsHashDB, AsPlainDB, Prefix};
+use parking_lot::RwLock;
+use blake2_rfc::blake2b::blake2b;
+
+struct HasherKeyType<H: Hasher>(H::Out);
+impl<H: Hasher> KeyType for HasherKeyType<H> {
+	const SIZE: usize = H::LENGTH;
+	fn from_data(data: &[u8]) -> Self { Self(H::hash(data)) }
+}
+impl<H: Hasher> AsRef<[u8]> for HasherKeyType<H> {
+	fn as_ref(&self) -> &[u8] { self.0.as_ref() }
+}
+impl<H: Hasher> AsMut<[u8]> for HasherKeyType<H> {
+	fn as_mut(&mut self) -> &mut [u8] { self.0.as_mut() }
+}
+impl<H: Hasher> Eq for HasherKeyType<H> {}
+impl<H: Hasher> PartialEq for HasherKeyType<H> {
+	fn eq(&self, other: &Self) -> bool { self.0 == other.0 }
+}
+impl<H: Hasher> Clone for HasherKeyType<H> {
+	fn clone(&self) -> Self { Self(self.0.clone()) }
+}
+impl<H: Hasher> std::fmt::Debug for HasherKeyType<H> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{:?}", self.0)
+	}
+}
+
+use parity_scale_codec as codec;
+impl<H: Hasher> codec::Encode for HasherKeyType<H> {
+	fn encode_to<T: codec::Output>(&self, dest: &mut T) {
+		dest.write(self.0.as_ref())
+	}
+}
+impl<H: Hasher> codec::Decode for HasherKeyType<H> {
+	fn decode<T: codec::Input>(src: &mut T) -> Result<Self, codec::Error> {
+		let mut result = H::Out::default();
+		src.read(result.as_mut())?;
+		Ok(Self(result))
+	}
+}
+
+pub struct SafeDatabase<K: KeyType>(RwLock<Database<K>>);
+
+impl<H: Hasher> HashDB<H, Vec<u8>> for SafeDatabase<HasherKeyType<H>> {
+	fn get(&self, key: &H::Out, _prefix: Prefix) -> Option<Vec<u8>> {
+		// UGH!!!
+		self.0.read().get(&HasherKeyType(key.clone()))
+	}
+
+	/// Check for the existance of a hash-key.
+	fn contains(&self, key: &H::Out, _prefix: Prefix) -> bool {
+		self.0.read().contains(&HasherKeyType(key.clone()))
+	}
+
+	/// Insert a datum item into the DB and return the datum's hash for a later lookup. Insertions
+	/// are counted and the equivalent number of `remove()`s must be performed before the data
+	/// is considered dead.
+	fn insert(&mut self, _prefix: Prefix, value: &[u8]) -> H::Out {
+		HasherKeyType(self.0.write().insert(value, None))
+	}
+
+	/// Like `insert()`, except you provide the key and the data is all moved.
+	fn emplace(&mut self, key: H::Out, _prefix: Prefix, value: &[u8]) {
+		HasherKeyType(self.0.write().insert(value, Some(HasherKeyType(key))));
+	}
+
+	/// Remove a datum previously inserted. Insertions can be "owed" such that the same number of
+	/// `insert()`s may happen without the data being eventually being inserted into the DB.
+	/// It can be "owed" more than once.
+	fn remove(&mut self, key: &H::Out, _prefix: Prefix) {
+		self.0.write().remove(&HasherKeyType(key.clone()));
+	}
+}
+
+impl<H: Hasher> AsHashDB<H, Vec<u8>> for SafeDatabase<HasherKeyType<H>> {
+	fn as_hash_db(&self) -> &dyn HashDB<H, Vec<u8>> { &self }
+	fn as_hash_db_mut<'a>(&'a mut self) -> &'a mut (dyn HashDB<H, Vec<u8>> + 'a) { &mut self }
+}
+
+impl<K: codec::Encode> PlainDB<K, Vec<u8>> for SafeDatabase<[u8; 32]> {
+	/// Look up a given hash into the bytes that hash to it, returning None if the
+	/// hash is not known.
+	fn get(&self, key: &K) -> Option<Vec<u8>> {
+		let hash = key.using_encoded(|d| blake2b(32, &[], d).as_bytes().try_into())
+			.expect("We asked for 32 bytes; qed");
+		self.0.read().get(&hash)
+	}
+
+	/// Check for the existance of a hash-key.
+	fn contains(&self, key: &K) -> bool {
+		let hash = key.using_encoded(|d| blake2b(32, &[], d).as_bytes().try_into())
+			.expect("We asked for 32 bytes; qed");
+		self.0.read().contains(&hash)
+	}
+
+	/// Insert a datum item into the DB. Insertions are counted and the equivalent
+	/// number of `remove()`s must be performed before the data is considered dead.
+	/// The caller should ensure that a key only corresponds to one value.
+	fn emplace(&mut self, key: K, value: Vec<u8>) {
+		let hash = key.using_encoded(|d| blake2b(32, &[], d).as_bytes().try_into())
+			.expect("We asked for 32 bytes; qed");
+		HasherKeyType(self.0.write().insert(&value, Some(hash)));
+	}
+
+	/// Remove a datum previously inserted. Insertions can be "owed" such that the
+	/// same number of `insert()`s may happen without the data being eventually
+	/// being inserted into the DB. It can be "owed" more than once.
+	/// The caller should ensure that a key only corresponds to one value.
+	fn remove(&mut self, key: &K) {
+		let hash = key.using_encoded(|d| blake2b(32, &[], d).as_bytes().try_into())
+			.expect("We asked for 32 bytes; qed");
+		self.0.write().remove(&hash);
+	}
+}
+
+impl<K: codec::Encode> AsPlainDB<K, Vec<u8>> for SafeDatabase<[u8; 32]> {
+	fn as_plain_db(&self) -> &dyn PlainDB<K, Vec<u8>> { &self }
+	fn as_plain_db_mut<'a>(&'a mut self) -> &'a mut (dyn PlainDB<K, Vec<u8>> + 'a) { &mut self }
+}
+*/

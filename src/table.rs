@@ -1,13 +1,16 @@
 use std::path::PathBuf;
 use std::fs::{File, OpenOptions};
 use std::mem::size_of;
-use std::cell::{RefCell, RefMut};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::ops::{Deref, DerefMut};
+use parking_lot::{
+	RwLock, RwLockWriteGuard, RwLockReadGuard, MappedRwLockReadGuard, RwLockUpgradableReadGuard
+};
+use log::trace;
 use memmap::{MmapMut, MmapOptions};
 use parity_scale_codec::{self as codec, Encode, Decode};
 use crate::types::{KeyType, SimpleWriter};
 use crate::datum_size::DatumSize;
-use std::ops::DerefMut;
-use log::trace;
 
 /// How many references a storage table item has.
 pub type RefCount = u16;
@@ -20,13 +23,13 @@ pub type TableItemIndex = u16;
 pub type TableItemCount = u32;
 
 /// A time index for our LRU system.
-pub type LruIndex = u64;
+pub type LruIndex = AtomicU64;
 
 pub struct Table<K> {
 	file: File,
 	path: PathBuf,
-	data: MmapMut,
-	header_data: MmapMut,
+	data: RwLock<MmapMut>,
+	header_data: RwLock<MmapMut>,
 	header: TableHeader,
 	item_header_size: usize,
 	item_size: usize,
@@ -35,9 +38,9 @@ pub struct Table<K> {
 	table_header_size: usize,
 	correction_factor: CorrectionFactor,
 
-	maps: Vec<RefCell<Option<(MmapMut, LruIndex)>>>,
-	lru_index: RefCell<LruIndex>,
-	mapped: RefCell<usize>,
+	maps: RwLock<Vec<Option<(MmapMut, LruIndex)>>>,
+	lru_index: LruIndex,
+	mapped: AtomicUsize,
 
 	_dummy: std::marker::PhantomData<K>,
 }
@@ -151,7 +154,7 @@ impl<K: Encode + Decode + Eq> ItemHeader<K> {
 
 impl<K: KeyType> Table<K> {
 	pub fn commit(&mut self) {
-		self.data.flush().expect("I/O Error");
+		self.data.write().flush().expect("I/O Error");
 	}
 
 	pub fn open(path: PathBuf, datum_size: DatumSize, min_items_backed: TableItemCount) -> Self {
@@ -207,30 +210,30 @@ impl<K: KeyType> Table<K> {
 		trace!(target: "table", "Read header: {:?}", header);
 		let maps_count = if value_size == 0 { header.touched_count as usize } else { 0 };
 		let mut maps = Vec::new();
-		maps.resize_with(maps_count,|| RefCell::new(None));
+		maps.resize_with(maps_count,|| None);
 		trace!(target: "table", "Maps is now: {} items: {:?}", maps.len(), maps);
 
 		Self {
-			path, file, data, header_data, header, item_count, item_size, item_header_size, value_size, correction_factor,
-			table_header_size, maps, lru_index: RefCell::new(0), mapped: RefCell::new(0), _dummy: Default::default()
+			path, file, data: RwLock::new(data), header_data: RwLock::new(header_data), header, item_count, item_size, item_header_size, value_size, correction_factor,
+			table_header_size, maps: RwLock::new(maps), lru_index: Default::default(), mapped: Default::default(), _dummy: Default::default()
 		}
 	}
 
 	/// Extend the file, and also the amount mapped to hold twice as many items as it does currently
 	/// but no more than its maximum allowed `item_count`.
 	fn extend(&mut self, min_items: TableItemCount) {
-		self.item_count = ((self.data.len() / self.item_size * 2)
+		self.item_count = ((self.data.read().len() / self.item_size * 2)
 			.min(self.item_count as usize) as TableItemCount)
 			.max(min_items);
 		self.file.set_len(self.item_count as u64 * self.item_size as u64 + self.table_header_size as u64)
 			.expect("File must be writable.");
-		self.header_data = unsafe {
+		*self.header_data.write() = unsafe {
 			MmapOptions::new()
 				.len(self.table_header_size)
 				.map_mut(&self.file)
 				.expect("Path must be writable.")
 		};
-		self.data = unsafe {
+		*self.data.write() = unsafe {
 			MmapOptions::new()
 				.offset(self.table_header_size as u64)
 				.map_mut(&self.file)
@@ -242,7 +245,7 @@ impl<K: KeyType> Table<K> {
 	///
 	/// This will panic if `index >= self.item_count`.
 	fn ensure_referencable(&mut self, index: TableItemIndex) {
-		let items_backed = (self.data.len() / self.item_size) as TableItemCount;
+		let items_backed = (self.data.read().len() / self.item_size) as TableItemCount;
 		let index = index as TableItemCount;
 		assert!(index < self.item_count, "Oversize index. WTF?");
 		if index >= items_backed {
@@ -260,17 +263,22 @@ impl<K: KeyType> Table<K> {
 	/// Will return `None` if `i` is not an item we currently have stored, `Some(mapped_bytes)` with
 	/// the number of bytes that has been additionally mapped (0 if it was already mapped) if it is
 	/// stored.
-	fn ensure_mapped(&self, i: TableItemIndex, create: Option<u64>) -> Result<RefMut<MmapMut>, ()> {
+	fn ensure_mapped(&self, i: TableItemIndex, create: Option<u64>) -> Result<MappedRwLockReadGuard<MmapMut>, ()> {
 		trace!(target: "table", "Mapping table index {}", i);
-		let item_cell = self.maps.get(i as usize).ok_or(())?;
-		let mut item = item_cell.borrow_mut();
-		let lru_index = { let mut i = self.lru_index.borrow_mut(); *i += 1; *i };
-		if let Some(ref mut inner) = item.deref_mut() {
+		let maps = self.maps.upgradable_read();
+		let lru_index = self.lru_index.fetch_add(1, Relaxed);
+		let i = i as usize;
+		let maps = if maps.get(i).ok_or(())?.deref().is_some() {
 			trace!(target: "table", "Already mapped");
-			inner.1 = lru_index;
+			maps.get(i)
+				.ok_or(())?
+				.deref()
+				.expect("is_some above ^")
+				.1.store(lru_index, Relaxed);
+			RwLockUpgradableReadGuard::downgrade(maps)
 		} else {
 			trace!(target: "table", "Opening table index contents...");
-			let name = self.contents_name(i);
+			let name = self.contents_name(i as TableItemIndex);
 			let file = OpenOptions::new()
 				.read(true)
 				.write(true)
@@ -281,11 +289,15 @@ impl<K: KeyType> Table<K> {
 				file.set_len(size);
 			}
 			let data = unsafe { MmapOptions::new().map_mut(&file).map_err(|_| ())? };
-			*self.mapped.borrow_mut() += data.len();
+			self.mapped.fetch_add(data.len(), Relaxed);
 			trace!(target: "table", "Contents: {}", hex::encode(data.as_ref()));
-			*item = Some((data, lru_index));
-		}
-		Ok(RefMut::map(item, |i| &mut i.as_mut().expect("We just guaranteed this is Some").0))
+			let mut maps = RwLockUpgradableReadGuard::upgrade(maps);
+			*maps.get_mut(i)
+				.ok_or(())?
+				.deref_mut() = Some((data, lru_index.into()));
+			RwLockWriteGuard::downgrade(maps)
+		};
+		Ok(RwLockReadGuard::map(maps, |maps| &maps[i].expect("guaranteed above").0))
 	}
 
 	fn contents_name(&self, i: TableItemIndex) -> PathBuf {
@@ -297,24 +309,24 @@ impl<K: KeyType> Table<K> {
 	/// Returns `Some(bytes)` with the bytes unmapped, if it was previously mapped. `Some(0)` if it
 	/// was not previously mapped, and `None` if we are not storing an item at this index.
 	fn ensure_not_mapped(&mut self, i: TableItemIndex) -> Option<usize> {
-		let bytes = self.maps.get_mut(i as usize)?.get_mut().take().map_or(0, |i| i.0.len());
-		*self.mapped.get_mut() -= bytes;
+		let bytes = self.maps.write().get_mut(i as usize)?.take().map_or(0, |i| i.0.len());
+		self.mapped.fetch_sub(bytes, Relaxed);
 		Some(bytes)
 	}
 
 	/// Reduce the number of items mapped until the total size is less than `maximum_size`.
 	pub fn shrink_to(&mut self, maximum_size: usize, shrink_size: usize) {
-		let mut mapped = *self.mapped.borrow();
-		if mapped > maximum_size {
-			let mut sorted = self.maps.iter()
-				.enumerate()
-				.filter_map(|(i, c)| c.borrow().as_ref().clone().map(|x| (x.1, i as TableItemIndex)))
-				.collect::<Vec<_>>();
+		if self.mapped.load(Relaxed) > maximum_size {
+			let mut sorted = {
+				self.maps.read().iter()
+					.enumerate()
+					.filter_map(|(i, c)| c.as_ref().clone().map(|x| (x.1.load(Relaxed), i as TableItemIndex)))
+					.collect::<Vec<_>>()
+			};
 			sorted.sort();
 			for (_, i) in sorted.into_iter() {
-				mapped = mapped.checked_sub(self.ensure_not_mapped(i).unwrap_or(0))
-					.expect("`mapped` underflow. Database corruption?");
-				if mapped <= shrink_size {
+				self.mapped.fetch_sub(self.ensure_not_mapped(i).unwrap_or(0), Relaxed);
+				if self.mapped.load(Relaxed) <= shrink_size {
 					break;
 				}
 			}
@@ -323,21 +335,21 @@ impl<K: KeyType> Table<K> {
 
 	fn set_header(&mut self, h: TableHeader) {
 		self.header = h;
-		self.header.encode_to(&mut SimpleWriter(self.header_data.as_mut(), 0));
+		self.header.encode_to(&mut SimpleWriter(self.header_data.write().as_mut(), 0));
 	}
 
 	/// The total amount of bytes stored on disk for this table.
 	pub fn bytes_used(&self) -> usize {
-		self.data.len() + self.header.external_data as usize
+		self.data.read().len() + self.header.external_data as usize
 	}
 
 	/// The amount of bytes currently mapped into memory for this table.
 	#[allow(dead_code)]
 	pub fn bytes_mapped(&self) -> usize {
 		if self.value_size == 0 {
-			self.data.len() + *self.mapped.borrow()
+			self.data.read().len() + self.mapped.load(Relaxed)
 		} else {
-			self.data.len()
+			self.data.read().len()
 		}
 	}
 
@@ -346,33 +358,37 @@ impl<K: KeyType> Table<K> {
 		f: impl FnOnce(&mut ItemHeader<K>) -> R,
 	) -> Result<R, ()> {
 		if i as TableItemCount >= self.item_count { return Err(()) }
-		let data = &mut self.data[
-			self.item_size * i as usize..self.item_size * i as usize + self.item_header_size
-		];
-		println!("data: {}; CF: {:?}", hex::encode(&data), self.correction_factor);
-		let mut h = ItemHeader::decode(&mut &data[..], self.correction_factor)
-			.expect("Database corrupt?");
+		let offset = self.item_size * i as usize;
+		let data = self.data.upgradable_read();
+		let mut h = {
+			let mut item_data = &data[offset..offset + self.item_header_size];
+			ItemHeader::decode(&mut item_data, self.correction_factor)
+				.expect("Database corrupt?")
+		};
 		let r = f(&mut h);
-		h.encode_to(&mut SimpleWriter(data, 0), self.correction_factor);
+
+		let data = RwLockUpgradableReadGuard::upgrade(data);
+		let mut item_data = &mut data[offset..offset + self.item_header_size];
+		h.encode_to(&mut SimpleWriter(item_data, 0), self.correction_factor);
 		Ok(r)
 	}
 
 	fn item_header(&self, i: TableItemIndex) -> Result<ItemHeader<K>, ()> {
 		if i as TableItemCount >= self.item_count { return Err(()) }
-		let data = &self.data[
-			self.item_size * i as usize..self.item_size * i as usize + self.item_header_size
-		];
-		Ok(ItemHeader::decode(&mut &data[..], self.correction_factor)
+		let offset = self.item_size * i as usize;
+		let data = self.data.read();
+		let mut item_data = &data[offset..offset + self.item_header_size];
+		Ok(ItemHeader::decode(&mut item_data, self.correction_factor)
 			.expect("Database corrupt?"))
 	}
 
 	#[allow(dead_code)]
-	fn set_item_header<R>(&mut self, i: TableItemIndex, h: ItemHeader<K>) -> Result<(), ()> {
+	fn set_item_header(&mut self, i: TableItemIndex, h: ItemHeader<K>) -> Result<(), ()> {
 		if i as TableItemCount >= self.item_count { return Err(()) }
-		let data = &mut self.data[
-			self.item_size * i as usize..self.item_size * i as usize + self.item_header_size
-		];
-		h.encode_to(&mut SimpleWriter(data, 0), self.correction_factor);
+		let offset = self.item_size * i as usize;
+		let data = self.data.write();
+		let item_data = &mut data[offset..offset + self.item_header_size];
+		h.encode_to(&mut SimpleWriter(item_data, 0), self.correction_factor);
 		Ok(())
 	}
 
@@ -388,23 +404,15 @@ impl<K: KeyType> Table<K> {
 	}
 
 	/// Retrieve a table item's data as an immutable pointer.
-	pub fn item_ref(&self, i: TableItemIndex, check_hash: Option<&K>) -> Result<&[u8], ()> {
+	pub fn item_ref(&self, i: TableItemIndex, check_hash: Option<&K>) -> Result<MappedRwLockReadGuard<&[u8]>, ()> {
 		let header = self.item_header(i).and_then(|h| h.as_allocation(check_hash))?;
 		Ok(if self.value_size == 0 {
-			self.ensure_mapped(i, None);
-			unsafe {
-				self.maps.get(i as usize)
-					.ok_or(())?
-					.try_borrow_unguarded()
-					.expect("We never retain a mutable borrow and no functions are reentrant")
-					.as_ref()
-					.ok_or(())?
-					.0.as_ref()
-			}
+			let mmap = self.ensure_mapped(i, None)?;
+			MappedRwLockReadGuard::map(mmap, |m| &m.as_ref())
 		} else {
 			let size = self.value_size - header.1;
 			let p = self.item_size * i as usize + self.item_header_size;
-			&self.data[p..p + size]
+			RwLockReadGuard::map(self.data.read(), |d| &&d[p..p + size])
 		})
 	}
 
@@ -415,7 +423,7 @@ impl<K: KeyType> Table<K> {
 		} else {
 			let size = self.value_size - header.as_allocation(None)?.1;
 			let p = self.item_size * i as usize + self.item_header_size;
-			self.data[p..p + size].copy_from_slice(data)
+			self.data.write()[p..p + size].copy_from_slice(data)
 		}
 		Ok(())
 	}
@@ -432,16 +440,17 @@ impl<K: KeyType> Table<K> {
 	/// references. Err if the slot is not allocated or if the given `hash` if different to the
 	/// hash of the entry.
 	pub fn bump(&mut self, i: TableItemIndex, hash: Option<&K>) -> Result<RefCount, ()> {
-		self.mutate_item_header(i, |item| {
-			match item {
-				ItemHeader::Allocated { ref mut ref_count, ref key, .. } => {
-					Self::check_key(hash, key)?;
-					*ref_count += 1;
-					Ok(*ref_count)
-				}
-				ItemHeader::Free(..) => Err(()),
+		let mut item = self.item_header(i)?;
+		let rc = match item {
+			ItemHeader::Allocated { ref mut ref_count, ref key, .. } => {
+				Self::check_key(hash, key)?;
+				*ref_count += 1;
+				*ref_count
 			}
-		}).and_then(|i| i)
+			ItemHeader::Free(..) => return Err(()),
+		};
+		self.set_item_header(i, item);
+		Ok(rc)
 	}
 
 	/// Attempt to allocate a slot.
@@ -478,9 +487,10 @@ impl<K: KeyType> Table<K> {
 			h.external_data += size as u64;
 		}
 		self.set_header(h);
-		if self.maps.len() <= result as usize {
+		let maps = self.maps.upgradable_read();
+		if maps.len() <= result as usize {
 			let new_len = (result as usize * 3 / 2).max(self.item_count as usize);
-			self.maps.resize_with(new_len, || RefCell::new(None));
+			RwLockUpgradableReadGuard::upgrade(maps).resize_with(new_len, || None);
 		}
 		Some(result)
 	}
@@ -555,12 +565,12 @@ mod tests {
 			let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into(), 65536);
 			let x = t.allocate(&[42u8], 12).unwrap();
 			t.set_item(x, b"Hello world!");
-			assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
+			assert_eq!(t.item_ref(x, None).unwrap().as_ref(), b"Hello world!");
 			t.commit();
 			x
 		};
 		let t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into(), 65536);
-		assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
+		assert_eq!(t.item_ref(x, None).unwrap().as_ref(), b"Hello world!");
 	}
 
 	#[test]
@@ -571,12 +581,12 @@ mod tests {
 			let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), DatumSize::Oversize, 65536);
 			let x = t.allocate(&[42u8], 12).unwrap();
 			t.set_item(x, b"Hello world!");
-			assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
+			assert_eq!(t.item_ref(x, None).unwrap().as_ref(), b"Hello world!");
 			t.commit();
 			x
 		};
 		let t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), DatumSize::Oversize, 65536);
-		assert_eq!(t.item_ref(x, Some(&[42u8])).unwrap(), b"Hello world!");
+		assert_eq!(t.item_ref(x, Some(&[42u8])).unwrap().as_ref(), b"Hello world!");
 	}
 
 	#[test]
@@ -588,12 +598,12 @@ mod tests {
 			let x = t.allocate(&[42u8], 12).unwrap();
 			t.set_item(x, b"Hello world!");
 			assert_eq!(t.bytes_used(), 36);
-			assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
+			assert_eq!(t.item_ref(x, None).unwrap().as_ref(), b"Hello world!");
 			t.commit();
 			x
 		};
 		let t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into(), 0);
-		assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
+		assert_eq!(t.item_ref(x, None).unwrap().as_ref(), b"Hello world!");
 	}
 
 	#[test]
@@ -606,11 +616,11 @@ mod tests {
 			let x = t.allocate(&[42u8], 12).unwrap();
 			t.set_item(x, b"Hello world!");
 			assert_eq!(t.bytes_used(), 15);
-			assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
+			assert_eq!(t.item_ref(x, None).unwrap().as_ref(), b"Hello world!");
 			t.commit();
 			x
 		};
 		let t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), DatumSize::Oversize, 0);
-		assert_eq!(t.item_ref(x, None).unwrap(), b"Hello world!");
+		assert_eq!(t.item_ref(x, None).unwrap().as_ref(), b"Hello world!");
 	}
 }
