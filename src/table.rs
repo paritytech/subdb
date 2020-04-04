@@ -263,7 +263,7 @@ impl<K: KeyType> Table<K> {
 	/// Will return `None` if `i` is not an item we currently have stored, `Some(mapped_bytes)` with
 	/// the number of bytes that has been additionally mapped (0 if it was already mapped) if it is
 	/// stored.
-	fn ensure_mapped(&self, i: TableItemIndex, create: Option<u64>) -> Result<MappedRwLockReadGuard<MmapMut>, ()> {
+	fn ensure_mapped<'a>(&'a self, i: TableItemIndex, create: Option<u64>) -> Result<MappedRwLockReadGuard<'a, MmapMut>, ()> {
 		trace!(target: "table", "Mapping table index {}", i);
 		let maps = self.maps.upgradable_read();
 		let lru_index = self.lru_index.fetch_add(1, Relaxed);
@@ -297,7 +297,7 @@ impl<K: KeyType> Table<K> {
 				.deref_mut() = Some((data, lru_index.into()));
 			RwLockWriteGuard::downgrade(maps)
 		};
-		Ok(RwLockReadGuard::map(maps, |maps| &maps[i].expect("guaranteed above").0))
+		Ok(RwLockReadGuard::map(maps, |maps| &maps[i].as_ref().expect("guaranteed above").0))
 	}
 
 	fn contents_name(&self, i: TableItemIndex) -> PathBuf {
@@ -404,15 +404,17 @@ impl<K: KeyType> Table<K> {
 	}
 
 	/// Retrieve a table item's data as an immutable pointer.
-	pub fn item_ref(&self, i: TableItemIndex, check_hash: Option<&K>) -> Result<MappedRwLockReadGuard<&[u8]>, ()> {
+	pub fn item_ref<'a>(&'a self, i: TableItemIndex, check_hash: Option<&K>) -> Result<MappedRwLockReadGuard<'a, [u8]>, ()> {
 		let header = self.item_header(i).and_then(|h| h.as_allocation(check_hash))?;
 		Ok(if self.value_size == 0 {
-			let mmap = self.ensure_mapped(i, None)?;
-			MappedRwLockReadGuard::map(mmap, |m| &m.as_ref())
+			let mmap: MappedRwLockReadGuard<'a, MmapMut> = self.ensure_mapped(i, None)?;
+
+			fn extract(mmap: &MmapMut) -> &[u8] { &mmap.as_ref() }
+			MappedRwLockReadGuard::<'a, MmapMut>::map(mmap, extract)
 		} else {
 			let size = self.value_size - header.1;
 			let p = self.item_size * i as usize + self.item_header_size;
-			RwLockReadGuard::map(self.data.read(), |d| &&d[p..p + size])
+			RwLockReadGuard::map(self.data.read(), |d| &d[p..p + size])
 		})
 	}
 

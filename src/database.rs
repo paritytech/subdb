@@ -194,7 +194,7 @@ impl<K: KeyType> Database<K> {
 		self.get_ref(hash).map(|d| d.to_vec())
 	}
 
-	pub fn get_ref(&self, hash: &K) -> Option<MappedRwLockReadGuard<&[u8]>> {
+	pub fn get_ref(&self, hash: &K) -> Option<MappedRwLockReadGuard<[u8]>> {
 		self.index.with_item_try(hash, |entry|
 			self.content.item_ref(&entry.address, Some(hash))
 		)
