@@ -99,7 +99,8 @@ impl<K: KeyType> Content<K> {
 		let address = self.allocate(key, data.len());
 		let s = u8::from(address.datum_size) as usize;
 		self.tables[s as usize][address.content_table]
-			.set_item(address.entry_index as TableItemIndex, data);
+			.set_item(address.entry_index as TableItemIndex, data)
+			.expect("Unexpected error setting item");
 		self.idle();
 		address
 	}

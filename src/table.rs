@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::fs::{File, OpenOptions};
 use std::mem::size_of;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::{Relaxed, Acquire, Release}};
 use std::ops::{Deref, DerefMut};
 use parking_lot::{
 	RwLock, RwLockWriteGuard, RwLockReadGuard, MappedRwLockReadGuard, RwLockUpgradableReadGuard
@@ -118,7 +118,8 @@ impl<K: Encode + Decode + Eq> ItemHeader<K> {
 	fn decode<I: codec::Input>(input: &mut I, correction_factor: CorrectionFactor) -> Result<Self, codec::Error> {
 		let first_byte = input.read_byte()?;
 		Ok(if first_byte > 0 {
-			let ref_count = ((first_byte & !0b01111111) as u16) << 7 + input.read_byte()? as u16;
+			let second_byte = input.read_byte()? as u16;
+			let ref_count = (((first_byte & 0b01111111) as u16) << 8) + second_byte;
 			let size_correction = match correction_factor {
 				CorrectionFactor::None => 0u32,
 				CorrectionFactor::U8 => u8::decode(input)? as u32,
@@ -135,7 +136,8 @@ impl<K: Encode + Decode + Eq> ItemHeader<K> {
 		match self {
 			ItemHeader::Allocated { ref_count, size_correction, key} => {
 				assert!(*ref_count < 32768);
-				(((*ref_count >> 8) | 0b10000000) as u8).encode_to(output);
+				let first_byte = ((*ref_count >> 8) | 0b10000000) as u8;
+				first_byte.encode_to(output);
 				(*ref_count as u8).encode_to(output);
 				match correction_factor {
 					CorrectionFactor::None => {},
@@ -174,13 +176,13 @@ impl<K: KeyType> Table<K> {
 			256..=65535 => (CorrectionFactor::U16, 2),
 			_ => (CorrectionFactor::U32, 4),
 		};
-		println!("Table size correction: {:?}/{} bytes", correction_factor, correction_factor_size);
+		trace!(target: "table", "Table size correction: {:?}/{} bytes", correction_factor, correction_factor_size);
 		let item_count = datum_size.contents_entries() as TableItemCount;
 		let key_size = K::SIZE;
 		let item_header_size = (size_of::<RefCount>() + correction_factor_size + key_size)
 			.max(1 + size_of::<TableItemIndex>());
 		let item_size = value_size + item_header_size;
-		println!("Item size: {} bytes = rc {} + cfs {} + key {} + value {}", item_size, size_of::<RefCount>(), correction_factor_size, key_size, value_size);
+		trace!(target: "table", "Item size: {} bytes = rc {} + cfs {} + key {} + value {}", item_size, size_of::<RefCount>(), correction_factor_size, key_size, value_size);
 		let table_header_size = size_of::<TableHeader>();
 		let total_size = table_header_size + item_size * item_count as usize;
 		let minimum_size = table_header_size + item_size * item_count.min(min_items_backed) as usize;
@@ -263,19 +265,18 @@ impl<K: KeyType> Table<K> {
 	/// Will return `None` if `i` is not an item we currently have stored, `Some(mapped_bytes)` with
 	/// the number of bytes that has been additionally mapped (0 if it was already mapped) if it is
 	/// stored.
-	fn ensure_mapped<'a>(&'a self, i: TableItemIndex, create: Option<u64>) -> Result<MappedRwLockReadGuard<'a, MmapMut>, ()> {
+	fn ensure_mapped(&self, i: TableItemIndex, create: Option<u64>) -> Result<RwLockUpgradableReadGuard<Vec<Option<(MmapMut, LruIndex)>>>, ()> {
 		trace!(target: "table", "Mapping table index {}", i);
 		let maps = self.maps.upgradable_read();
 		let lru_index = self.lru_index.fetch_add(1, Relaxed);
 		let i = i as usize;
 		let maps = if maps.get(i).ok_or(())?.deref().is_some() {
 			trace!(target: "table", "Already mapped");
-			maps.get(i)
-				.ok_or(())?
-				.deref()
+			maps[i]
+				.as_ref()
 				.expect("is_some above ^")
 				.1.store(lru_index, Relaxed);
-			RwLockUpgradableReadGuard::downgrade(maps)
+			maps
 		} else {
 			trace!(target: "table", "Opening table index contents...");
 			let name = self.contents_name(i as TableItemIndex);
@@ -286,18 +287,18 @@ impl<K: KeyType> Table<K> {
 				.open(&name)
 				.map_err(|_| ())?;
 			if let Some(size) = create {
-				file.set_len(size);
+				file.set_len(size).map_err(|_| ())?;
 			}
 			let data = unsafe { MmapOptions::new().map_mut(&file).map_err(|_| ())? };
-			self.mapped.fetch_add(data.len(), Relaxed);
+			self.mapped.fetch_add(data.len(), Release);
 			trace!(target: "table", "Contents: {}", hex::encode(data.as_ref()));
 			let mut maps = RwLockUpgradableReadGuard::upgrade(maps);
 			*maps.get_mut(i)
 				.ok_or(())?
 				.deref_mut() = Some((data, lru_index.into()));
-			RwLockWriteGuard::downgrade(maps)
+			RwLockWriteGuard::downgrade_to_upgradable(maps)
 		};
-		Ok(RwLockReadGuard::map(maps, |maps| &maps[i].as_ref().expect("guaranteed above").0))
+		Ok(maps)
 	}
 
 	fn contents_name(&self, i: TableItemIndex) -> PathBuf {
@@ -310,13 +311,15 @@ impl<K: KeyType> Table<K> {
 	/// was not previously mapped, and `None` if we are not storing an item at this index.
 	fn ensure_not_mapped(&mut self, i: TableItemIndex) -> Option<usize> {
 		let bytes = self.maps.write().get_mut(i as usize)?.take().map_or(0, |i| i.0.len());
-		self.mapped.fetch_sub(bytes, Relaxed);
+		self.mapped.fetch_sub(bytes, Release);
 		Some(bytes)
 	}
 
 	/// Reduce the number of items mapped until the total size is less than `maximum_size`.
 	pub fn shrink_to(&mut self, maximum_size: usize, shrink_size: usize) {
-		if self.mapped.load(Relaxed) > maximum_size {
+		let current_size = self.mapped.load(Acquire);
+		println!("Considering shrinking. max: {}, shrink: {}, current: {}", maximum_size, shrink_size, current_size);
+		if current_size > maximum_size {
 			let mut sorted = {
 				self.maps.read().iter()
 					.enumerate()
@@ -325,8 +328,10 @@ impl<K: KeyType> Table<K> {
 			};
 			sorted.sort();
 			for (_, i) in sorted.into_iter() {
-				self.mapped.fetch_sub(self.ensure_not_mapped(i).unwrap_or(0), Relaxed);
-				if self.mapped.load(Relaxed) <= shrink_size {
+				let bytes_unmapped = self.ensure_not_mapped(i).unwrap_or(0);
+				let current_size = self.mapped.load(Acquire);
+				println!("Unmapped {}. current: {}, target: {}", bytes_unmapped, current_size, shrink_size);
+				if current_size <= shrink_size {
 					break;
 				}
 			}
@@ -367,8 +372,8 @@ impl<K: KeyType> Table<K> {
 		};
 		let r = f(&mut h);
 
-		let data = RwLockUpgradableReadGuard::upgrade(data);
-		let mut item_data = &mut data[offset..offset + self.item_header_size];
+		let mut data = RwLockUpgradableReadGuard::upgrade(data);
+		let item_data = &mut data[offset..offset + self.item_header_size];
 		h.encode_to(&mut SimpleWriter(item_data, 0), self.correction_factor);
 		Ok(r)
 	}
@@ -386,7 +391,7 @@ impl<K: KeyType> Table<K> {
 	fn set_item_header(&mut self, i: TableItemIndex, h: ItemHeader<K>) -> Result<(), ()> {
 		if i as TableItemCount >= self.item_count { return Err(()) }
 		let offset = self.item_size * i as usize;
-		let data = self.data.write();
+		let mut data = self.data.write();
 		let item_data = &mut data[offset..offset + self.item_header_size];
 		h.encode_to(&mut SimpleWriter(item_data, 0), self.correction_factor);
 		Ok(())
@@ -407,10 +412,12 @@ impl<K: KeyType> Table<K> {
 	pub fn item_ref<'a>(&'a self, i: TableItemIndex, check_hash: Option<&K>) -> Result<MappedRwLockReadGuard<'a, [u8]>, ()> {
 		let header = self.item_header(i).and_then(|h| h.as_allocation(check_hash))?;
 		Ok(if self.value_size == 0 {
-			let mmap: MappedRwLockReadGuard<'a, MmapMut> = self.ensure_mapped(i, None)?;
-
+			let map: MappedRwLockReadGuard<'a, MmapMut> = RwLockReadGuard::map(
+				RwLockUpgradableReadGuard::downgrade(self.ensure_mapped(i, None)?),
+				|maps| &maps[i as usize].as_ref().expect("guaranteed above").0,
+			);
 			fn extract(mmap: &MmapMut) -> &[u8] { &mmap.as_ref() }
-			MappedRwLockReadGuard::<'a, MmapMut>::map(mmap, extract)
+			MappedRwLockReadGuard::<'a, MmapMut>::map(map, extract)
 		} else {
 			let size = self.value_size - header.1;
 			let p = self.item_size * i as usize + self.item_header_size;
@@ -421,7 +428,11 @@ impl<K: KeyType> Table<K> {
 	pub fn set_item(&mut self, i: TableItemIndex, data: &[u8]) -> Result<(), ()> {
 		let header = self.item_header(i)?;
 		if self.value_size == 0 {
-			self.ensure_mapped(i, Some(data.len() as u64))?.copy_from_slice(data);
+			let mut maps = RwLockUpgradableReadGuard::upgrade(self.ensure_mapped(i, Some(data.len() as u64))?);
+			maps[i as usize]
+				.as_mut()
+				.expect("guaranteed above").0
+				.copy_from_slice(data);
 		} else {
 			let size = self.value_size - header.as_allocation(None)?.1;
 			let p = self.item_size * i as usize + self.item_header_size;
@@ -451,7 +462,7 @@ impl<K: KeyType> Table<K> {
 			}
 			ItemHeader::Free(..) => return Err(()),
 		};
-		self.set_item_header(i, item);
+		self.set_item_header(i, item)?;
 		Ok(rc)
 	}
 
@@ -523,7 +534,8 @@ impl<K: KeyType> Table<K> {
 				self.ensure_not_mapped(i);
 				let filename = self.contents_name(i);
 				let size = std::fs::metadata(&filename).expect("Table file missing. Database corruption?").len();
-				std::fs::remove_file(filename);
+				std::fs::remove_file(filename)
+					.expect("cannot remove data file. Permissions wrong?");
 				h.external_data = h.external_data.checked_sub(size)
 					.expect("external_data underflow. Database corruption?");
 			}
@@ -562,67 +574,69 @@ mod tests {
 
 	#[test]
 	fn database_should_work() {
-		let _ = std::fs::remove_file("/tmp/test-table");
+		let path = PathBuf::from("/tmp/test-table-database_should_work");
 		let x = {
-			let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into(), 65536);
+			let mut t = Table::<[u8; 1]>::open(path.clone(), 0.into(), 65536);
 			let x = t.allocate(&[42u8], 12).unwrap();
-			t.set_item(x, b"Hello world!");
+			t.set_item(x, b"Hello world!").unwrap();
 			assert_eq!(t.item_ref(x, None).unwrap().as_ref(), b"Hello world!");
 			t.commit();
 			x
 		};
-		let t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into(), 65536);
+		let t = Table::<[u8; 1]>::open(path.clone(), 0.into(), 65536);
 		assert_eq!(t.item_ref(x, None).unwrap().as_ref(), b"Hello world!");
 	}
 
 	#[test]
 	fn thin_table_should_work() {
-		let _ = std::fs::remove_file("/tmp/test-table");
+		let path = PathBuf::from("/tmp/test-table-thin_table_should_work");
 		for i in 0..10 { let _ = std::fs::remove_file(format!("/tmp/test-table.{}", i)); }
 		let x = {
-			let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), DatumSize::Oversize, 65536);
+			let mut t = Table::<[u8; 1]>::open(path.clone(), DatumSize::Oversize, 65536);
 			let x = t.allocate(&[42u8], 12).unwrap();
-			t.set_item(x, b"Hello world!");
+			t.set_item(x, b"Hello world!").unwrap();
 			assert_eq!(t.item_ref(x, None).unwrap().as_ref(), b"Hello world!");
 			t.commit();
 			x
 		};
-		let t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), DatumSize::Oversize, 65536);
+		let t = Table::<[u8; 1]>::open(path.clone(), DatumSize::Oversize, 65536);
 		assert_eq!(t.item_ref(x, Some(&[42u8])).unwrap().as_ref(), b"Hello world!");
 	}
 
 	#[test]
 	fn table_extension_should_work() {
-		let _ = std::fs::remove_file("/tmp/test-table");
+		let path = PathBuf::from("/tmp/test-table-table_extension_should_work");
+		let _ = std::fs::remove_file(&path);
 		let x = {
-			let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into(), 0);
+			let mut t = Table::<[u8; 1]>::open(path.clone(), 0.into(), 0);
 			assert_eq!(t.bytes_used(), 0);
 			let x = t.allocate(&[42u8], 12).unwrap();
-			t.set_item(x, b"Hello world!");
+			t.set_item(x, b"Hello world!").unwrap();
 			assert_eq!(t.bytes_used(), 36);
 			assert_eq!(t.item_ref(x, None).unwrap().as_ref(), b"Hello world!");
 			t.commit();
 			x
 		};
-		let t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), 0.into(), 0);
+		let t = Table::<[u8; 1]>::open(path.clone(), 0.into(), 0);
 		assert_eq!(t.item_ref(x, None).unwrap().as_ref(), b"Hello world!");
 	}
 
 	#[test]
 	fn oversize_table_extension_should_work() {
-		let _ = std::fs::remove_file("/tmp/test-table");
+		let path = PathBuf::from("/tmp/test-table-oversize_table_extension_should_work");
+		let _ = std::fs::remove_file(&path);
 		for i in 0..10 { let _ = std::fs::remove_file(format!("/tmp/test-table.{}", i)); }
 		let x = {
-			let mut t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), DatumSize::Oversize, 0);
+			let mut t = Table::<[u8; 1]>::open(path.clone(), DatumSize::Oversize, 0);
 			assert_eq!(t.bytes_used(), 0);
 			let x = t.allocate(&[42u8], 12).unwrap();
-			t.set_item(x, b"Hello world!");
+			t.set_item(x, b"Hello world!").unwrap();
 			assert_eq!(t.bytes_used(), 15);
 			assert_eq!(t.item_ref(x, None).unwrap().as_ref(), b"Hello world!");
 			t.commit();
 			x
 		};
-		let t = Table::<[u8; 1]>::open(PathBuf::from("/tmp/test-table"), DatumSize::Oversize, 0);
+		let t = Table::<[u8; 1]>::open(path.clone(), DatumSize::Oversize, 0);
 		assert_eq!(t.item_ref(x, None).unwrap().as_ref(), b"Hello world!");
 	}
 }

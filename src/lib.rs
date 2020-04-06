@@ -41,18 +41,18 @@ mod tests {
 	use std::path::PathBuf;
 
 	fn init() {
-		simplelog::CombinedLogger::init(
+		let _ = simplelog::CombinedLogger::init(
 			vec![
 				simplelog::TermLogger::new(simplelog::LevelFilter::Info, simplelog::Config::default(), simplelog::TerminalMode::Mixed).unwrap(),
 			]
-		).unwrap();
+		);
 	}
 
 	#[test]
 	fn contains_key_works() {
 		init();
-		let path = PathBuf::from("/tmp/test");
-		let _ = std::fs::remove_dir_all(&path).unwrap();
+		let path = PathBuf::from("/tmp/test-contains_key_works");
+		let _ = std::fs::remove_dir_all(&path);
 
 		type Key = [u8; 8];
 		let key = {
@@ -62,7 +62,6 @@ mod tests {
 				.path(path.clone())
 				.open::<Key>()
 				.unwrap();
-			// Insert 1MB of zeros
 			db.insert(b"Hello world!", None).1
 		};
 
@@ -70,7 +69,7 @@ mod tests {
 			let mut db = Options::from_path(path.clone()).open::<Key>().unwrap();
 			// Check it's there.
 			assert!(db.contains_key(&key));
-			db.remove(&key);
+			db.remove(&key).unwrap();
 			assert!(!db.contains_key(&key));
 		}
 	}
@@ -78,8 +77,8 @@ mod tests {
 	#[test]
 	fn oversize_allocation_works() {
 		init();
-		let path = PathBuf::from("/tmp/test");
-		let _ = std::fs::remove_dir_all(&path).unwrap();
+		let path = PathBuf::from("/tmp/test-oversize_allocation_works");
+		let _ = std::fs::remove_dir_all(&path);
 
 		type Key = [u8; 8];
 		let key = {
@@ -98,7 +97,7 @@ mod tests {
 			// Check it's there.
 			assert_eq!(db.get_ref(&key).unwrap().as_ref(), &[0u8; 1024 * 1024][..]);
 			// Delete it.
-			db.remove(&key);
+			db.remove(&key).unwrap();
 		}
 
 		{
@@ -111,8 +110,8 @@ mod tests {
 	#[test]
 	fn oversize_allocation_shrink_works() {
 		init();
-		let path = PathBuf::from("/tmp/test");
-		let _ = std::fs::remove_dir_all(&path).unwrap();
+		let path = PathBuf::from("/tmp/test-oversize_allocation_shrink_works");
+		let _ = std::fs::remove_dir_all(&path);
 
 		type Key = [u8; 8];
 		let mut db = Options::new()
@@ -146,8 +145,8 @@ mod tests {
 	#[test]
 	fn general_use_should_work() {
 		init();
-		let path = PathBuf::from("/tmp/test");
-		let _ = std::fs::remove_dir_all(&path).unwrap();
+		let path = PathBuf::from("/tmp/test-general_use_should_work");
+		let _ = std::fs::remove_dir_all(&path);
 
 		type Key = [u8; 8];
 		let key = {
