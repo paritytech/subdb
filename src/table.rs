@@ -71,7 +71,7 @@ enum CorrectionFactor {
 }
 
 #[derive(Clone, Debug)]
-enum ItemHeader<K: Encode + Decode> {
+enum ItemHeader<K: AsRef<[u8]> + AsMut<[u8]> + Default> {
 	Allocated {
 		/// Number of times this item has been inserted, without a corresponding remove, into the
 		/// database.
@@ -86,7 +86,7 @@ enum ItemHeader<K: Encode + Decode> {
 	),
 }
 
-impl<K: Encode + Decode + Eq> ItemHeader<K> {
+impl<K: AsRef<[u8]> + AsMut<[u8]> + Default + Eq> ItemHeader<K> {
 	fn as_next_free(&self) -> TableItemIndex {
 		match self {
 			ItemHeader::Free(next_free) => *next_free,
@@ -126,7 +126,9 @@ impl<K: Encode + Decode + Eq> ItemHeader<K> {
 				CorrectionFactor::U16 => u16::decode(input)? as u32,
 				CorrectionFactor::U32 => u32::decode(input)?,
 			};
-			Self::Allocated { ref_count, size_correction, key: K::decode(input)? }
+			let mut key = K::default();
+			input.read(key.as_mut())?;
+			Self::Allocated { ref_count, size_correction, key }
 		} else {
 			Self::Free(TableItemIndex::decode(input)?)
 		})
@@ -145,7 +147,7 @@ impl<K: Encode + Decode + Eq> ItemHeader<K> {
 					CorrectionFactor::U16 => (*size_correction as u16).encode_to(output),
 					CorrectionFactor::U32 => (*size_correction as u32).encode_to(output),
 				}
-				key.encode_to(output);
+				output.write(key.as_ref());
 			}
 			ItemHeader::Free(index) => {
 				(0u8, index).encode_to(output);
@@ -178,7 +180,7 @@ impl<K: KeyType> Table<K> {
 		};
 		trace!(target: "table", "Table size correction: {:?}/{} bytes", correction_factor, correction_factor_size);
 		let item_count = datum_size.contents_entries() as TableItemCount;
-		let key_size = K::SIZE;
+		let key_size = std::mem::size_of::<K>();
 		let item_header_size = (size_of::<RefCount>() + correction_factor_size + key_size)
 			.max(1 + size_of::<TableItemIndex>());
 		let item_size = value_size + item_header_size;

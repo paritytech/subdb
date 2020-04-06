@@ -22,6 +22,7 @@ simplelog = "^0.7.4"
 twox-hash = "1.5.0"
 hash-db = "0.15.2"
 parking_lot = "0.10.0"
+sp-database = { version = "2.0.0-alpha.5", git = "https://github.com/paritytech/substrate", branch = "gav-db-trait" }
 
 [dev-dependencies]
 criterion = "0.3.1"

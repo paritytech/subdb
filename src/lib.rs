@@ -6,10 +6,12 @@ mod error;
 mod index;
 mod index_item;
 mod metadata;
+mod safe_database;
 mod table;
 mod types;
 
 pub use database::Options;
+pub use safe_database::SafeDatabase;
 pub use content_address::ContentAddress;
 pub use error::Error;
 pub use types::KeyType;
@@ -39,6 +41,7 @@ mod tests {
 	use super::*;
 	use log::info;
 	use std::path::PathBuf;
+	use crate::types::Blake2Output;
 
 	fn init() {
 		let _ = simplelog::CombinedLogger::init(
@@ -54,7 +57,7 @@ mod tests {
 		let path = PathBuf::from("/tmp/test-contains_key_works");
 		let _ = std::fs::remove_dir_all(&path);
 
-		type Key = [u8; 8];
+		type Key = Blake2Output<[u8; 8]>;
 		let key = {
 			let mut db = Options::new()
 				.key_bytes(2)
@@ -62,7 +65,7 @@ mod tests {
 				.path(path.clone())
 				.open::<Key>()
 				.unwrap();
-			db.insert(b"Hello world!", None).1
+			db.store(b"Hello world!").1
 		};
 
 		{
@@ -80,7 +83,7 @@ mod tests {
 		let path = PathBuf::from("/tmp/test-oversize_allocation_works");
 		let _ = std::fs::remove_dir_all(&path);
 
-		type Key = [u8; 8];
+		type Key = Blake2Output<[u8; 8]>;
 		let key = {
 			let mut db = Options::new()
 				.key_bytes(2)
@@ -89,7 +92,7 @@ mod tests {
 				.open::<Key>()
 				.unwrap();
 			// Insert 1MB of zeros
-			db.insert(&[0u8; 1024*1024][..], None).1
+			db.store(&[0u8; 1024*1024][..]).1
 		};
 
 		{
@@ -113,7 +116,7 @@ mod tests {
 		let path = PathBuf::from("/tmp/test-oversize_allocation_shrink_works");
 		let _ = std::fs::remove_dir_all(&path);
 
-		type Key = [u8; 8];
+		type Key = Blake2Output<[u8; 8]>;
 		let mut db = Options::new()
 			.key_bytes(2)
 			.index_bits(4)
@@ -124,12 +127,12 @@ mod tests {
 			.unwrap();
 		let keys = (0..8).map(|i|
 			// Insert 1MB of zeros
-			db.insert(&[i; 1024 * 1024][..], None).1
+			db.store(&[i; 1024 * 1024][..]).1
 		).collect::<Vec<_>>();
 		assert_eq!(db.bytes_mapped(), 8 * 1024 * 1024 + 655360);
 
 		// Trigger shrinking.
-		let key8 = db.insert(&[8u8; 1024 * 1024][..], None).1;
+		let key8 = db.store(&[8u8; 1024 * 1024][..]).1;
 		assert_eq!(db.bytes_mapped(), 2 * 1024 * 1024 + 655360);
 
 		// Should only be 6 & 7 left now.
@@ -148,7 +151,7 @@ mod tests {
 		let path = PathBuf::from("/tmp/test-general_use_should_work");
 		let _ = std::fs::remove_dir_all(&path);
 
-		type Key = [u8; 8];
+		type Key = Blake2Output<[u8; 8]>;
 		let key = {
 			let mut db = Options::new()
 				.key_bytes(2)
@@ -156,7 +159,7 @@ mod tests {
 				.path(path.clone())
 				.open::<Key>()
 				.unwrap();
-			db.insert(b"Hello world!", None).1
+			db.store(b"Hello world!").1
 		};
 
 		let mut number3 = Key::default();
@@ -165,7 +168,7 @@ mod tests {
 			for i in 0..100 {
 				let value = format!("The number {}", i);
 				println!("👉 Inserting: {}", value);
-				let key = db.insert(value.as_bytes(), None).1;
+				let key = db.store(value.as_bytes()).1;
 				if i == 3 {
 					number3 = key;
 				}

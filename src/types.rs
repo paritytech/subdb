@@ -1,26 +1,44 @@
 use blake2_rfc::blake2b::blake2b;
-use parity_scale_codec::{self as codec, Encode, Decode};
+use parity_scale_codec::{self as codec, Encode};
+use std::fmt::Debug;
 
 pub type TableIndex = usize;
 pub type EntryIndex = usize;
 
-pub trait KeyType: AsRef<[u8]> + AsMut<[u8]> + Encode + Decode + Eq + PartialEq + Clone + std::fmt::Debug {
-	const SIZE: usize;
-	fn from_data(data: &[u8]) -> Self;
-}
+pub trait KeyType: AsRef<[u8]> + AsMut<[u8]> + Default + Eq + PartialEq + Clone + Debug {}
+
+impl<
+	T: AsRef<[u8]> + AsMut<[u8]> + Default + Eq + PartialEq + Clone + Debug
+> KeyType for T {}
 
 pub trait EncodedSize: Encode {
 	fn encoded_size() -> usize;
 }
 
+pub trait HashOutput: KeyType {
+	fn from_data(data: &[u8]) -> Self;
+}
+
+#[derive(Default, Eq, PartialEq, Clone, Debug)]
+pub struct Blake2Output<T>(pub T);
+
 macro_rules! do_array {
 	($n:tt $( $rest:tt )*) => {
-		impl KeyType for [u8; $n] {
-			const SIZE: usize = $n;
+		impl HashOutput for Blake2Output<[u8; $n]> {
 			fn from_data(data: &[u8]) -> Self {
 				let mut r = Self::default();
-				r.copy_from_slice(&blake2b($n, &[], data).as_bytes()[..]);
+				r.as_mut().copy_from_slice(&blake2b($n, &[], data).as_bytes()[..]);
 				r
+			}
+		}
+		impl AsRef<[u8]> for Blake2Output<[u8; $n]> {
+			fn as_ref(&self) -> &[u8] {
+				&self.0[..]
+			}
+		}
+		impl AsMut<[u8]> for Blake2Output<[u8; $n]> {
+			fn as_mut(&mut self) -> &mut [u8] {
+				&mut self.0[..]
 			}
 		}
 		do_array!{ $($rest)* }
