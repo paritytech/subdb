@@ -5,10 +5,10 @@ use std::fmt::Debug;
 pub type TableIndex = usize;
 pub type EntryIndex = usize;
 
-pub trait KeyType: AsRef<[u8]> + AsMut<[u8]> + Default + Eq + PartialEq + Clone + Debug {}
+pub trait KeyType: AsRef<[u8]> + AsMut<[u8]> + Default + Eq + PartialEq + Clone + Debug + Send + Sync {}
 
 impl<
-	T: AsRef<[u8]> + AsMut<[u8]> + Default + Eq + PartialEq + Clone + Debug
+	T: AsRef<[u8]> + AsMut<[u8]> + Default + Eq + PartialEq + Clone + Debug + Send + Sync
 > KeyType for T {}
 
 pub trait EncodedSize: Encode {

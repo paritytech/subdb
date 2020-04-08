@@ -24,12 +24,12 @@ impl<H: KeyType> sp_database::Database<H> for SafeDatabase<H> {
 		self.0.read().get(&hash)
 	}
 
-	fn with_get<R>(&self, col: ColumnId, key: &[u8], f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+	fn with_get(&self, col: ColumnId, key: &[u8], f: &mut dyn FnMut(&[u8])) {
 		let mut hash = H::default();
 		(col, key).using_encoded(|d|
 			hash.as_mut().copy_from_slice(blake2b(32, &[], d).as_bytes())
 		);
-		self.0.read().get_ref(&hash).map(|d| f(d.as_ref()))
+		let _ = self.0.read().get_ref(&hash).map(|d| f(d.as_ref()));
 	}
 
 	fn set(&self, col: ColumnId, key: &[u8], value: &[u8]) {
@@ -52,8 +52,8 @@ impl<H: KeyType> sp_database::Database<H> for SafeDatabase<H> {
 		self.0.read().get(hash)
 	}
 
-	fn with_lookup<R>(&self, hash: &H, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-		self.0.read().get_ref(hash).map(|d| f(d.as_ref()))
+	fn with_lookup(&self, hash: &H, f: &mut dyn FnMut(&[u8])) {
+		let _ = self.0.read().get_ref(hash).map(|d| f(d.as_ref()));
 	}
 
 	fn store(&self, hash: &H, preimage: &[u8]) {
