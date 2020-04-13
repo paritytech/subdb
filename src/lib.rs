@@ -10,7 +10,7 @@ mod safe_database;
 mod table;
 mod types;
 
-pub use database::Options;
+pub use database::{Options, Database};
 pub use safe_database::SafeDatabase;
 pub use content_address::ContentAddress;
 pub use error::Error;
