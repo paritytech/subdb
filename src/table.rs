@@ -6,7 +6,7 @@ use std::ops::{Deref, DerefMut};
 use parking_lot::{
 	RwLock, RwLockWriteGuard, RwLockReadGuard, MappedRwLockReadGuard, RwLockUpgradableReadGuard
 };
-use log::trace;
+use log::{trace, debug};
 use memmap::{MmapMut, MmapOptions};
 use parity_scale_codec::{self as codec, Encode, Decode};
 use crate::types::{KeyType, SimpleWriter};
@@ -320,7 +320,7 @@ impl<K: KeyType> Table<K> {
 	/// Reduce the number of items mapped until the total size is less than `maximum_size`.
 	pub fn shrink_to(&mut self, maximum_size: usize, shrink_size: usize) {
 		let current_size = self.mapped.load(Acquire);
-		println!("Considering shrinking. max: {}, shrink: {}, current: {}", maximum_size, shrink_size, current_size);
+		trace!(target: "table", "Considering shrinking. max: {}, shrink: {}, current: {}", maximum_size, shrink_size, current_size);
 		if current_size > maximum_size {
 			let mut sorted = {
 				self.maps.read().iter()
@@ -332,7 +332,7 @@ impl<K: KeyType> Table<K> {
 			for (_, i) in sorted.into_iter() {
 				let bytes_unmapped = self.ensure_not_mapped(i).unwrap_or(0);
 				let current_size = self.mapped.load(Acquire);
-				println!("Unmapped {}. current: {}, target: {}", bytes_unmapped, current_size, shrink_size);
+				debug!(target: "table", "Unmapped {}. current: {}, target: {}", bytes_unmapped, current_size, shrink_size);
 				if current_size <= shrink_size {
 					break;
 				}
